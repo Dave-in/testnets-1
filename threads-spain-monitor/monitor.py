@@ -28,6 +28,8 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from html_report import render_html
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = ROOT / "config.json"
 DEFAULT_DB = ROOT / "data" / "threads.db"
@@ -109,6 +111,18 @@ CREATE TABLE IF NOT EXISTS posts (
     seen_runs INTEGER DEFAULT 1,
     queries TEXT DEFAULT '[]'
 );
+CREATE TABLE IF NOT EXISTS replies (
+    id TEXT PRIMARY KEY,
+    parent_id TEXT,
+    text TEXT,
+    username TEXT,
+    permalink TEXT,
+    timestamp TEXT,
+    like_count INTEGER,
+    reply_count INTEGER,
+    last_seen TEXT
+);
+CREATE INDEX IF NOT EXISTS replies_parent ON replies(parent_id);
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     started TEXT,
@@ -147,7 +161,7 @@ def upsert_post(db: sqlite3.Connection, post: dict, source: str, query: str | No
     ts = now_iso()
     row = db.execute("SELECT best_rank, queries FROM posts WHERE id=?", (pid,)).fetchone()
     likes = _int_or_none(post.get("like_count") or post.get("likes"))
-    replies = _int_or_none(post.get("reply_count") or post.get("replies"))
+    replies = _int_or_none(post.get("reply_count") or (post.get("replies") if not isinstance(post.get("replies"), list) else None))
     reposts = _int_or_none(post.get("repost_count") or post.get("reposts"))
     if row is None:
         db.execute(
@@ -172,6 +186,39 @@ def upsert_post(db: sqlite3.Connection, post: dict, source: str, query: str | No
         (ts, best, json.dumps(sorted(queries), ensure_ascii=False), likes, replies, reposts, pid),
     )
     return False
+
+
+def upsert_reply(db: sqlite3.Connection, parent_id: str, r: dict) -> None:
+    rid = str(r.get("id") or r.get("permalink") or "").strip()
+    if not rid or not (r.get("text") or "").strip():
+        return
+    db.execute(
+        "INSERT INTO replies (id,parent_id,text,username,permalink,timestamp,like_count,reply_count,last_seen)"
+        " VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET"
+        " text=excluded.text, like_count=COALESCE(excluded.like_count, like_count),"
+        " reply_count=COALESCE(excluded.reply_count, reply_count), last_seen=excluded.last_seen",
+        (rid, parent_id, r["text"], r.get("username"), r.get("permalink"), r.get("timestamp"),
+         _int_or_none(r.get("like_count") or r.get("likes")),
+         _int_or_none(r.get("reply_count") or r.get("replies_count")), now_iso()),
+    )
+
+
+def store_post(db: sqlite3.Connection, post: dict, source: str, query: str | None, rank: int | None) -> bool:
+    """Пост + вложенный список ответов (поле "replies", если это список)."""
+    is_new = upsert_post(db, post, source, query, rank)
+    replies = post.get("replies")
+    if isinstance(replies, list):
+        pid = str(post.get("id") or post.get("permalink") or "").strip()
+        for r in replies:
+            upsert_reply(db, pid, r)
+    return is_new
+
+
+def load_replies(db: sqlite3.Connection) -> dict[str, list[dict]]:
+    out = defaultdict(list)
+    for r in db.execute("SELECT * FROM replies ORDER BY COALESCE(like_count,0) DESC, COALESCE(reply_count,0) DESC"):
+        out[r["parent_id"]].append({k: r[k] for k in ("id", "text", "username", "permalink", "timestamp", "like_count", "reply_count")})
+    return out
 
 
 # ---------------------------------------------------------------- Threads API
@@ -265,7 +312,7 @@ def cmd_import(args, cfg) -> int:
     new = 0
     for rank, p in enumerate(posts):
         r = _int_or_none(p.get("rank"))
-        new += upsert_post(db, p, args.source, p.get("query"), r)
+        new += store_post(db, p, args.source, p.get("query"), r)
     db.execute("INSERT INTO runs (started,source,fetched,new_posts) VALUES (?,?,?,?)",
                (now_iso(), args.source, len(posts), new))
     db.commit()
@@ -356,7 +403,8 @@ def analyze(db: sqlite3.Connection, cfg: dict, days: int, top_n: int, now: datet
             "username": row["username"],
             "permalink": row["permalink"],
             "timestamp": ts.isoformat(),
-            "likes": row["like_count"], "replies": row["reply_count"],
+            "likes": row["like_count"], "replies": row["reply_count"], "reposts": row["repost_count"],
+            "queries": json.loads(row["queries"] or "[]"),
             "top_rank": row["best_rank"],
             "score": score_post(row, cls, weights, now, days),
             **cls,
@@ -397,6 +445,7 @@ def analyze(db: sqlite3.Connection, cfg: dict, days: int, top_n: int, now: datet
         "locations": dict(loc_cur.most_common()),
         "trends": trends,
         "top_posts": posts[:top_n],
+        "all_posts": posts,
         "polls": build_polls(trends, cfg, limit=6),
         "hot_combos": [{"topic": t, "intent": i, "posts": n} for (t, i), n in combo.most_common(10)],
     }
@@ -483,9 +532,12 @@ def cmd_analyze(args, cfg) -> int:
     (out_dir / f"report_{stamp}.md").write_text(md, encoding="utf-8")
     (out_dir / "latest.md").write_text(md, encoding="utf-8")
     (out_dir / "latest.json").write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
+    html = render_html(res, load_replies(db))
+    (out_dir / f"report_{stamp}.html").write_text(html, encoding="utf-8")
+    (out_dir / "latest.html").write_text(html, encoding="utf-8")
     if not args.quiet:
         print(md)
-    print(f"Отчёт: {out_dir / 'latest.md'}  (данные: {out_dir / 'latest.json'})", file=sys.stderr)
+    print(f"Отчёт: {out_dir / 'latest.html'}  (также latest.md и latest.json)", file=sys.stderr)
     return 0
 
 
@@ -507,7 +559,10 @@ def cmd_demo(args, cfg) -> int:
         # демо-данные хранят возраст поста в днях, чтобы демо всегда было «свежим»
         p = dict(p)
         p["timestamp"] = (now - timedelta(days=float(p.pop("age_days", 0)))).isoformat()
-        upsert_post(db, p, "demo", p.get("query"), _int_or_none(p.get("rank")))
+        now_ts = now
+        for r in p.get("replies") or []:
+            r["timestamp"] = (now_ts - timedelta(days=float(r.pop("age_days", 0)))).isoformat()
+        store_post(db, p, "demo", p.get("query"), _int_or_none(p.get("rank")))
     db.commit()
     args.db = demo_db
     return cmd_analyze(args, cfg)

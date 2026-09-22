@@ -9,6 +9,16 @@
     "lookback_days": 7
   },
 
+  "scraper": {
+    "_comment": "Сбор через свой браузер (scraper.py). Не ставьте слишком агрессивно — это ваш аккаунт.",
+    "scrolls_per_query": 5,
+    "open_top_posts": 25,
+    "max_replies_per_post": 30,
+    "delay_seconds": [2.0, 5.0],
+    "recent_too": true,
+    "headless": false
+  },
+
   "search_queries": [
     "Аликанте", "Коста Бланка", "Торревьеха", "Бенидорм", "Эльче", "Дения", "Хавеа",
     "Кальпе", "Альтеа", "Ориуэла", "Санта Пола", "Валенсия переезд",
