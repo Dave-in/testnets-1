@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+config.toml
+data/*.csv
+reports/*
+!reports/.gitkeep
+!data/.gitkeep
+state/
+logs/
