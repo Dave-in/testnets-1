@@ -120,7 +120,7 @@ class FakeMarket:
 def test_paper_runner_trades_and_persists(tmp_path):
     cfg = make_cfg()
     market = FakeMarket({"ETH/USDT": trend_frame()})
-    state = tmp_path / "paper.json"
+    state = tmp_path / "new_dir" / "paper.json"  # папки еще нет
     runner = Runner(cfg, market, PaperBroker(0.001, 0.0005), state)
     for _ in range(100):
         runner.step()
@@ -139,7 +139,7 @@ def test_paper_runner_trades_and_persists(tmp_path):
         again.step()
         market.i += 1
     assert again.book.units["ETH/USDT"] == 0
-    assert (tmp_path / "paper_trades.csv").exists()
+    assert (tmp_path / "new_dir" / "paper_trades.csv").exists()
 
 
 class FakeExchange:
@@ -171,3 +171,47 @@ def test_exchange_broker_fee_in_base_currency():
     b = ExchangeBroker(FakeExchange([{"currency": "USDT", "cost": 2.0}]), fee=0.001)
     f = b.market_order("ETH/USDT", "sell", 1.0, 2000.0)
     assert f.units == 1.0 and f.cost == pytest.approx(1998.0)
+
+
+def test_control_commands(tmp_path):
+    from bot.live import control_path
+
+    cfg = make_cfg()
+    market = FakeMarket({"ETH/USDT": trend_frame()})
+    state = tmp_path / "paper.json"
+    runner = Runner(cfg, market, PaperBroker(0.001, 0.0005), state)
+    for _ in range(100):
+        runner.step()
+        market.i += 1
+    assert runner.book.units["ETH/USDT"] > 0
+
+    control_path(state).write_text(json.dumps({"command": "close-all"}))
+    runner.step()
+    assert runner.book.units["ETH/USDT"] == 0 and runner.paused
+    for _ in range(10):  # на паузе бот не входит заново
+        market.i += 1
+        runner.step()
+    assert runner.book.units["ETH/USDT"] == 0
+
+    control_path(state).write_text(json.dumps({"command": "resume"}))
+    for _ in range(5):
+        market.i += 1
+        runner.step()
+    assert not runner.paused
+
+    control_path(state).write_text(json.dumps({"command": "stop"}))
+    runner.run()  # должен выйти сам, без бесконечного цикла
+    assert runner.stop_requested
+
+
+def test_top_n_keeps_strongest():
+    from bot.core import Decider
+
+    cfg = make_cfg("balanced")
+    cfg.strategy.max_positions = 1
+    d = Decider(cfg, 10_000)
+    rows = {"ETH/USDT": pd.Series({"mom": 0.5, "vol": 0.5}),
+            "BTC/USDT": pd.Series({"mom": 0.2, "vol": 0.5}),
+            "SOL/USDT": pd.Series({"mom": 0.9, "vol": 3.0})}
+    wants = d._top_n({s: True for s in rows}, rows)
+    assert wants == {"ETH/USDT": True, "BTC/USDT": False, "SOL/USDT": False}

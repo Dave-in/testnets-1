@@ -159,7 +159,8 @@ class Backtester:
         trades = pd.DataFrame(self.trades, columns=["ts", "symbol", "side", "units", "price",
                                                     "notional", "fee", "reason"])
         ppy = periods_per_year(cfg.exchange.timeframe)
-        m = metrics.compute(eq["equity"], ppy, trades, eq["exposure"])
+        m = metrics.compute(eq["equity"], ppy, trades, eq["exposure"],
+                            cfg.portfolio.monthly_target)
         return BacktestResult(eq, trades, decider.guard.events, m, self._benchmarks(eq.index, ppy))
 
     def _benchmarks(self, idx: pd.DatetimeIndex, ppy: int) -> dict[str, dict]:

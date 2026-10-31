@@ -27,10 +27,22 @@ class Decider:
             self.reset_signals()
         wants = {s: update_signal(rows[s], self.states[s], self.cfg.strategy)
                  for s in self.symbols if s in rows}
+        wants = self._top_n(wants, rows)
         vols = {s: float(rows[s]["vol"]) for s, w in wants.items() if w}
         weights = size_weights(vols, returns, self.caps, self.cfg.strategy,
                                self.cfg.exchange.timeframe, self.cfg.portfolio.max_gross_exposure)
         return {s: weights.get(s, 0.0) * mult for s in self.symbols}
+
+    def _top_n(self, wants: dict[str, bool], rows: dict[str, pd.Series]) -> dict[str, bool]:
+        """Если сигналов больше, чем max_positions, — оставляем самые сильные
+        (импульс с поправкой на волатильность)."""
+        n = self.cfg.strategy.max_positions
+        longs = [s for s, w in wants.items() if w]
+        if n <= 0 or len(longs) <= n:
+            return wants
+        score = {s: float(rows[s]["mom"]) / max(float(rows[s]["vol"]), 1e-9) for s in longs}
+        keep = set(sorted(longs, key=score.get, reverse=True)[:n])
+        return {s: w and s in keep for s, w in wants.items()}
 
     def check_stops(self, lows: dict[str, float], holdings: dict[str, float]) -> list[str]:
         """Какие позиции выбило трейлинг-стопом (lows — минимум бара или текущая цена)."""

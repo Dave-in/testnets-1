@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from .backtest import BacktestResult
-from .metrics import LABELS, fmt
+from .metrics import LABELS, fmt, monthly_returns
 
 
 def print_summary(res: BacktestResult) -> None:
@@ -27,6 +27,43 @@ def print_summary(res: BacktestResult) -> None:
         print(f"\nСрабатываний защиты от просадки: {len(stops)}")
         for e in stops[:10]:
             print(f"  {e['ts']}: просадка {e['drawdown'] * 100:.2f}%")
+
+
+def monthly_grid(equity: pd.Series) -> pd.DataFrame:
+    """Таблица год × месяц с доходностью."""
+    m = monthly_returns(equity)
+    grid = pd.DataFrame({"year": m.index.year, "month": m.index.month, "r": m.values})
+    return grid.pivot(index="year", columns="month", values="r").reindex(columns=range(1, 13))
+
+
+def print_monthly(equity: pd.Series, target: float) -> None:
+    grid = monthly_grid(equity)
+    print(f"\nДоходность по месяцам, %  (* — цель {target * 100:.0f}% выполнена)")
+    print("год  " + "".join(f"{m:>7}" for m in range(1, 13)) + "    год")
+    yearly = equity.resample("YE").last()
+    prev = yearly.shift(1)
+    prev.iloc[0] = equity.iloc[0]
+    for year, row in grid.iterrows():
+        cells = "".join("      ·" if pd.isna(v) else f"{v * 100:6.1f}{'*' if v >= target else ' '}"
+                        for v in row)
+        y = yearly[yearly.index.year == year]
+        yr = (y.iloc[0] / prev[y.index[0]] - 1) * 100 if len(y) else float("nan")
+        print(f"{year} {cells} {yr:6.1f}")
+
+
+def _monthly_html(equity: pd.Series, target: float) -> str:
+    grid = monthly_grid(equity)
+
+    def cell(v):
+        if pd.isna(v):
+            return "<td></td>"
+        cls = "hit" if v >= target else ("pos" if v > 0 else ("neg" if v < 0 else ""))
+        return f'<td class="{cls}">{v * 100:.1f}</td>'
+
+    head = "".join(f"<th>{m}</th>" for m in range(1, 13))
+    body = "".join(f"<tr><td>{y}</td>{''.join(cell(v) for v in row)}</tr>"
+                   for y, row in grid.iterrows())
+    return f"<table class=\"months\"><tr><th>Год</th>{head}</tr>{body}</table>"
 
 
 def _svg_line(series: dict[str, pd.Series], width=900, height=260, pct=False,
@@ -65,7 +102,8 @@ def _svg_line(series: dict[str, pd.Series], width=900, height=260, pct=False,
     return f'<div class="legend">{legend}</div>' + "".join(parts)
 
 
-def write(res: BacktestResult, out_dir: str | Path, title: str, close: pd.DataFrame) -> Path:
+def write(res: BacktestResult, out_dir: str | Path, title: str, close: pd.DataFrame,
+          monthly_target: float = 0.06) -> Path:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     res.equity.to_csv(out / "equity.csv")
@@ -107,11 +145,17 @@ td,th{{border-bottom:1px solid #e5e7eb;padding:6px 8px;text-align:right}}
 td:first-child,th:first-child{{text-align:left}}
 .chart{{width:100%;height:auto}} .grid{{stroke:#e5e7eb}} .axis{{font-size:11px;fill:#6b7280}}
 .legend{{font-size:13px;margin-top:16px}} .legend span{{margin-right:14px}}
+.months td{{text-align:center;font-size:13px}} .hit{{background:#86efac}} .pos{{background:#dcfce7}}
+.neg{{background:#fee2e2}} .note{{color:#6b7280;font-size:13px}}
+.months{{display:block;overflow-x:auto}}
 </style></head><body>
 <h1>{html.escape(title)}</h1>
 <h2>Капитал (старт = 100, лог. шкала)</h2>{_svg_line(curves, log=True)}
 <h2>Просадка бота</h2>{_svg_line(dd, height=180, pct=True)}
 <h2>Метрики</h2><table><tr><th></th>{head}</tr>{rows}</table>
+<h2>Доходность по месяцам, %</h2>
+<p class="note">Зеленый — цель {monthly_target * 100:.0f}% в месяц выполнена, светлый — плюс, красный — минус.</p>
+{_monthly_html(eq, monthly_target)}
 <h2>Последние сделки</h2>
 <table><tr><th>Время</th><th>Актив</th><th>Сторона</th><th>Цена</th><th>Сумма</th><th>Причина</th></tr>
 {trade_rows}</table>

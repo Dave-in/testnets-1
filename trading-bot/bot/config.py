@@ -20,6 +20,7 @@ class PortfolioConfig:
     profile: str = "core"
     initial_capital: float = 10_000.0
     max_gross_exposure: float = 1.0
+    monthly_target: float = 0.06  # цель по доходности в месяц (для отчета)
     profiles: dict[str, dict[str, float]] = field(
         default_factory=lambda: {"core": {"ETH/USDT": 1.0}}
     )
@@ -47,6 +48,7 @@ class StrategyConfig:
     rebalance_threshold: float = 0.2
     min_trade: float = 0.01
     reentry_cooldown_bars: int = 5
+    max_positions: int = 0  # 0 — без ограничения; N — держим только N сильнейших
 
     @property
     def warmup(self) -> int:

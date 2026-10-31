@@ -5,6 +5,9 @@
   2. когда закрылся новый бар — пересчитываем сигналы и ребалансируем портфель
      (та же логика Decider, что и в бэктесте);
   3. состояние сохраняется в JSON, поэтому бота можно перезапускать.
+
+Управление на ходу (из другого терминала): python -m bot ctl pause|resume|close-all|stop.
+Команда кладется в файл <state>_control.json, бот читает его на каждом шаге.
 """
 from __future__ import annotations
 
@@ -54,9 +57,12 @@ class Runner:
         self.broker = broker
         self.symbols = cfg.portfolio.symbols
         self.state_path = Path(state_path)
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self.decider = Decider(cfg, cfg.portfolio.initial_capital)
         self.book = Book(cash=cfg.portfolio.initial_capital, units={s: 0.0 for s in self.symbols})
         self.last_bar: str | None = None
+        self.paused = False          # пауза по команде: новых сделок нет, стопы работают
+        self.stop_requested = False
         self.history_limit = min(1000, max(500, cfg.strategy.warmup * 4))
         self._load()
 
@@ -70,6 +76,7 @@ class Runner:
                          units={s: st["book"]["units"].get(s, 0.0) for s in self.symbols})
         self.decider.load_dict(st["decider"])
         self.last_bar = st.get("last_bar")
+        self.paused = st.get("paused", False)
         log.info("Состояние восстановлено из %s (последний бар %s)", self.state_path, self.last_bar)
 
     def _save(self) -> None:
@@ -79,6 +86,7 @@ class Runner:
             "book": {"cash": self.book.cash, "units": self.book.units},
             "decider": self.decider.to_dict(),
             "last_bar": self.last_bar,
+            "paused": self.paused,
             "saved_at": datetime.now(timezone.utc).isoformat(),
         }, ensure_ascii=False, indent=2, default=str))
         tmp.replace(self.state_path)
@@ -164,14 +172,41 @@ class Runner:
         self.last_bar = bar_ts
         return bar_ts
 
+    @property
+    def control_path(self) -> Path:
+        return control_path(self.state_path)
+
+    def apply_control(self, prices: dict[str, float]) -> None:
+        if not self.control_path.exists():
+            return
+        cmd = json.loads(self.control_path.read_text()).get("command")
+        self.control_path.unlink()
+        log.warning("Команда управления: %s", cmd)
+        if cmd == "pause":
+            self.paused = True
+        elif cmd == "resume":
+            self.paused = False
+        elif cmd == "close-all":
+            for s in self.symbols:
+                self._sell_all(s, prices[s], "manual_close_all")
+            self.decider.reset_signals()
+            self.paused = True
+        elif cmd == "stop":
+            self.stop_requested = True
+        else:
+            log.error("Неизвестная команда: %s", cmd)
+
     def step(self) -> None:
         prices = self.market.prices(self.symbols)
+        self.apply_control(prices)
         self.check_risk(prices)
-        self.on_new_bar(prices)
+        if not self.paused:
+            self.on_new_bar(prices)
         equity = self.book.equity(prices)
         self._journal("equity", {"ts": datetime.now(timezone.utc).isoformat(), "equity": equity,
                                  "cash": self.book.cash, "peak": self.decider.guard.peak,
-                                 "drawdown": self.decider.guard.drawdown(equity)})
+                                 "drawdown": self.decider.guard.drawdown(equity),
+                                 "paused": self.paused})
         self._save()
 
     def run(self, once: bool = False) -> None:
@@ -182,9 +217,19 @@ class Runner:
                 raise
             except Exception:  # сеть/биржа: логируем и пробуем на следующем круге
                 log.exception("Ошибка на шаге, повтор через %ss", self.cfg.live.poll_seconds)
-            if once:
+            if once or self.stop_requested:
+                log.info("Бот остановлен. Позиции сохранены в %s", self.state_path)
                 return
             time.sleep(self.cfg.live.poll_seconds)
+
+
+def control_path(state_path: Path) -> Path:
+    return state_path.with_name(f"{state_path.stem}_control.json")
+
+
+def state_path_for(cfg: Config) -> Path:
+    return (Path(cfg.live.state_dir)
+            / f"{cfg.exchange.mode}_{cfg.exchange.name}_{cfg.portfolio.profile}.json")
 
 
 def build_runner(cfg: Config, confirm_live: bool = False) -> Runner:
@@ -205,5 +250,4 @@ def build_runner(cfg: Config, confirm_live: bool = False) -> Runner:
                                 cfg.exchange.fee)
     else:
         raise SystemExit(f"Неизвестный режим: {mode}")
-    state = Path(cfg.live.state_dir) / f"{mode}_{name}_{cfg.portfolio.profile}.json"
-    return Runner(cfg, market, broker, state)
+    return Runner(cfg, market, broker, state_path_for(cfg))

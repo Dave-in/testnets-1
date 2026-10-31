@@ -5,6 +5,8 @@
   python -m bot backtest  --synthetic                      # проверка механики без интернета
   python -m bot walkforward --start 2020-01-01 --window 365 # по годам/окнам
   python -m bot run                                        # paper/testnet/live (по config)
+  python -m bot ctl status | pause | resume | close-all | stop
+  python -m bot logs -n 50
 """
 from __future__ import annotations
 
@@ -61,7 +63,8 @@ def cmd_backtest(args) -> None:
     print(title + "\n")
     report.print_summary(res)
     close = pd.DataFrame({s: df["close"] for s, df in frames.items()})
-    path = report.write(res, args.out, title, close)
+    report.print_monthly(res.equity["equity"], cfg.portfolio.monthly_target)
+    path = report.write(res, args.out, title, close, cfg.portfolio.monthly_target)
     print(f"\nОтчет: {path}  (equity.csv, trades.csv, summary.json рядом)")
 
 
@@ -105,6 +108,56 @@ def cmd_run(args) -> None:
     build_runner(cfg, confirm_live=args.confirm_live).run(once=args.once)
 
 
+def cmd_ctl(args) -> None:
+    """Управление запущенным ботом и просмотр состояния."""
+    import json
+
+    from .live import control_path, state_path_for
+
+    cfg = _cfg(args)
+    if args.mode:
+        cfg.exchange.mode = args.mode
+    state = state_path_for(cfg)
+    if args.action != "status":
+        state.parent.mkdir(parents=True, exist_ok=True)
+        control_path(state).write_text(json.dumps({"command": args.action}))
+        print(f"Команда '{args.action}' отправлена. Бот выполнит ее в течение "
+              f"{cfg.live.poll_seconds} с (смотрите: python -m bot logs).")
+        return
+    if not state.exists():
+        print(f"Нет состояния {state} — бот в этом режиме еще не запускался.")
+        return
+    st = json.loads(state.read_text())
+    print(f"Режим: {cfg.exchange.mode}  биржа: {cfg.exchange.name}  профиль: {cfg.portfolio.profile}")
+    print(f"Сохранено: {st.get('saved_at')}   последний бар: {st.get('last_bar')}")
+    g = st["decider"]["guard"]
+    paused = "ПАУЗА (команда)" if st.get("paused") else (
+        "ОСТАНОВЛЕН защитой" if g.get("halted") else
+        f"пауза защиты, баров: {g['paused_left']}" if g.get("paused_left") else "торгует")
+    print(f"Статус: {paused}")
+    eq_path = state.with_name(f"{state.stem}_equity.csv")
+    if eq_path.exists():
+        last = pd.read_csv(eq_path).iloc[-1]
+        print(f"Капитал: {last['equity']:.2f} USDT  (кэш {last['cash']:.2f}, "
+              f"пик {last['peak']:.2f}, просадка {last['drawdown'] * 100:.2f}%)")
+    print("Позиции:")
+    for s, u in st["book"]["units"].items():
+        stop = st["decider"]["states"].get(s, {}).get("stop", 0)
+        if u > 0:
+            print(f"  {s}: {u:.6f}  стоп {stop:.4f}")
+    if not any(u > 0 for u in st["book"]["units"].values()):
+        print("  нет (всё в USDT)")
+
+
+def cmd_logs(args) -> None:
+    path = Path("logs/bot.log")
+    if not path.exists():
+        print("Лога пока нет: logs/bot.log")
+        return
+    for line in path.read_text(encoding="utf-8").splitlines()[-args.n:]:
+        print(line)
+
+
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(prog="python -m bot", description="Консервативный крипто-бот")
     p.add_argument("--config", default="config.toml")
@@ -136,6 +189,15 @@ def main(argv=None) -> None:
     r.add_argument("--once", action="store_true", help="один шаг и выход")
     r.add_argument("--confirm-live", action="store_true")
     r.set_defaults(func=cmd_run)
+
+    c = sub.add_parser("ctl", help="управление: status | pause | resume | close-all | stop")
+    c.add_argument("action", choices=["status", "pause", "resume", "close-all", "stop"])
+    c.add_argument("--mode", choices=["paper", "testnet", "live"])
+    c.set_defaults(func=cmd_ctl)
+
+    lg = sub.add_parser("logs", help="последние строки лога")
+    lg.add_argument("-n", type=int, default=40)
+    lg.set_defaults(func=cmd_logs)
 
     args = p.parse_args(argv)
     args.func(args)

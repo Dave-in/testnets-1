@@ -1,0 +1,52 @@
+# Агрессивный вариант: цель — 6% в месяц. Просадки будут заметно больше (лимит 25%).
+# Запуск: python -m bot --config config.aggressive.toml backtest --start 2020-01-01
+
+[exchange]
+name = "binance"          # binance | bybit | okx | любой из ccxt
+mode = "paper"            # paper (виртуальные деньги, реальные цены) | testnet | live
+timeframe = "1d"          # можно попробовать 4h
+fee = 0.001               # 0.1% taker (спот Binance/Bybit без скидок)
+slippage = 0.0005         # 0.05% проскальзывание на каждую сделку
+
+[portfolio]
+profile = "aggressive"
+initial_capital = 10000.0
+max_gross_exposure = 1.0    # спот, без плеча
+monthly_target = 0.06
+
+# Ротация: из этого списка держим до max_positions самых сильных по импульсу.
+[portfolio.profiles.aggressive]
+"ETH/USDT" = 0.40
+"BTC/USDT" = 0.40
+"SOL/USDT" = 0.30
+"BNB/USDT" = 0.30
+"XRP/USDT" = 0.30
+"DOGE/USDT" = 0.25
+"AVAX/USDT" = 0.25
+"LINK/USDT" = 0.25
+"ADA/USDT" = 0.25
+
+[strategy]
+fast_ema = 20
+slow_ema = 100
+momentum_lookback = 30
+atr_period = 14
+atr_stop_mult = 3.5
+vol_lookback = 20
+target_vol = 0.60          # в 5 раз больше риска, чем в консервативном конфиге
+rebalance_threshold = 0.2
+min_trade = 0.02
+reentry_cooldown_bars = 3
+max_positions = 4
+
+[risk]
+soft_drawdown = 0.10       # с -10% начинаем урезать позиции
+soft_scale = 0.4
+hard_drawdown = 0.25       # при -25% закрываем всё
+cooldown_bars = 5
+hard_stop_action = "pause"
+resume_drawdown = 0.10
+
+[live]
+poll_seconds = 60
+state_dir = "state"
