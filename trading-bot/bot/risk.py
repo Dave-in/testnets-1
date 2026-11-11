@@ -38,7 +38,7 @@ class DrawdownGuard:
 
     def check_intrabar(self, equity: float, ts=None) -> bool:
         """Проверка жесткого лимита. True — нужно немедленно закрыть всё."""
-        if self.active or self.cfg.hard_stop_action == "scale":
+        if self.active or self.cfg.hard_stop_action in ("scale", "off"):
             return False
         if self.drawdown(equity) >= self.cfg.hard_drawdown:
             self._trigger_hard(equity, ts)
@@ -49,6 +49,9 @@ class DrawdownGuard:
         """Вызывается на закрытии бара. Возвращает множитель для целевых весов (0..1)."""
         if self.halted:
             return 0.0
+        if self.cfg.hard_stop_action == "off":
+            self.peak = max(self.peak, equity)
+            return 1.0
         if self.paused_left > 0:
             self.paused_left -= 1
             if self.paused_left == 0:

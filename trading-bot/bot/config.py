@@ -67,6 +67,12 @@ class StrategyConfig:
     # Мера (efficiency ratio) = |цена сейчас − цена N баров назад| / сумма модулей изменений
     # за N баров: около 1 — ровное движение, около 0 — «пила». 0 — фильтр выключен.
     min_trend_quality: float = 0.0
+    # Учёт собственных ошибок (0 — выключено). Бот ведёт счёт по каждой связке
+    # «монета + направление» в единицах риска (R: +1 = заработал столько, сколько ставил на стоп).
+    learn_window: int = 0         # если последние N сделок связки в сумме в минусе — отключить её
+    learn_block_bars: int = 72    # на сколько баров отключать
+    learn_loss_streak: int = 0    # после N убыточных сделок подряд (по всем монетам) резать риск
+    learn_risk_cut: float = 0.5   # во сколько раз резать, пока не будет прибыльной сделки
     # Вход: "ema" — тренд по средним; "breakout" — пробой максимума за breakout_lookback баров
     entry_mode: str = "ema"
     breakout_lookback: int = 20
@@ -89,13 +95,23 @@ class RiskConfig:
     cooldown_bars: int = 10
     resume_drawdown: float = 0.04
     soft_scale: float = 0.25
-    hard_stop_action: str = "pause"
+    hard_stop_action: str = "pause"   # pause | halt | scale | off (защита выключена)
 
 
 @dataclass
 class LiveConfig:
     poll_seconds: int = 60
     state_dir: str = "state"
+
+
+@dataclass
+class ChallengeConfig:
+    """Режим «попыток»: маленький счёт, цель — умножить его в target_mult раз.
+    Попытка заканчивается победой (цель) или сливом (осталось меньше bust_fraction),
+    после чего начинается новая с тем же стартовым счётом."""
+    enabled: bool = False
+    target_mult: float = 10.0
+    bust_fraction: float = 0.2
 
 
 @dataclass
@@ -112,6 +128,7 @@ class Config:
     risk: RiskConfig = field(default_factory=RiskConfig)
     live: LiveConfig = field(default_factory=LiveConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    challenge: ChallengeConfig = field(default_factory=ChallengeConfig)
 
 
 def load_config(path: str | Path) -> Config:
@@ -124,4 +141,5 @@ def load_config(path: str | Path) -> Config:
         risk=RiskConfig(**raw.get("risk", {})),
         live=LiveConfig(**raw.get("live", {})),
         telegram=TelegramConfig(**raw.get("telegram", {})),
+        challenge=ChallengeConfig(**raw.get("challenge", {})),
     )

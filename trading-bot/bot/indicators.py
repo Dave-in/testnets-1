@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 
 TIMEFRAME_PERIODS_PER_YEAR = {
+    "15m": 96 * 365,
     "1h": 24 * 365,
     "2h": 12 * 365,
     "4h": 6 * 365,

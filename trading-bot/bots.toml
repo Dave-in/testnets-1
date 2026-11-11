@@ -18,3 +18,8 @@ signals = true
 name = "Спот-база"             # прежняя стратегия — для сравнения, без сигналов
 config = "config.signals.toml"
 signals = false
+
+[[bot]]
+name = "Турбо"                 # агрессивный режим попыток: 50 USDT → цель x10, плечо до x5
+config = "config.turbo.toml"
+signals = true

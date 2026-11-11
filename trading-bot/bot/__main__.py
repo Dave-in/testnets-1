@@ -94,6 +94,11 @@ def cmd_backtest(args) -> None:
     report.print_summary(res)
     close = pd.DataFrame({s: frames[s]["close"] for s in cfg.portfolio.symbols})
     report.print_monthly(res.equity["equity"], cfg.portfolio.monthly_target)
+    if cfg.challenge.enabled:
+        from . import challenge
+        print("\n" + challenge.summary_text(res.equity["equity"], cfg.challenge.target_mult,
+                                            cfg.challenge.bust_fraction,
+                                            cfg.portfolio.initial_capital))
     path = report.write(res, args.out, title, close, cfg.portfolio.monthly_target)
     print(f"\nОтчет: {path}  (equity.csv, trades.csv, summary.json рядом)")
 

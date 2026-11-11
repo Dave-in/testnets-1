@@ -12,13 +12,13 @@ REPO="${BOT_REPO:-https://github.com/Dave-in/testnets-1.git}"
 BRANCH="${BOT_BRANCH:-claude/trading-bot-exchanges-pp8kid}"
 DIR="${BOT_DIR:-$HOME/trading-bot-app}"
 SERVICE=trading-bot
-# По умолчанию запускаются сразу три виртуальных счёта из bots.toml (для сравнения стратегий):
-# «Спот-быстрый» (основной), «Фьючерсы» (лонги и шорты) и «Спот-база» (без сигналов).
+# По умолчанию запускаются все виртуальные счета из bots.toml (для сравнения стратегий):
+# «Спот-быстрый» (основной), «Фьючерсы», «Спот-база» (без сигналов) и «Турбо» (режим попыток).
 # Только один счёт: BOT_CONFIG=config.trend.toml (или другой config.*.toml) перед командой.
 if [ -n "${BOT_CONFIG:-}" ]; then
   RUN="-m bot --config $BOT_CONFIG run"; WHAT="$BOT_CONFIG"
 else
-  RUN="-m bot run-all"; WHAT="три виртуальных счёта (bots.toml)"
+  RUN="-m bot run-all"; WHAT="все виртуальные счета из bots.toml"
 fi
 say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 die() { printf '\nОШИБКА: %s\n' "$*" >&2; exit 1; }

@@ -28,6 +28,8 @@ class SymbolState:
     extreme_close: float = 0.0   # максимум закрытия (лонг) / минимум закрытия (шорт) с момента входа
     stop: float = 0.0
     cooldown_left: int = 0
+    entry_price: float = 0.0     # цена входа и расстояние до стопа на входе (доля цены) —
+    entry_risk: float = 0.0      # чтобы потом оценить сделку в единицах риска
 
     @property
     def in_position(self) -> bool:
@@ -131,6 +133,7 @@ def update_signal(row: pd.Series, st: SymbolState, cfg: StrategyConfig) -> int:
         if entry:
             st.side, st.extreme_close = 1, close
             st.stop = close - cfg.atr_stop_mult * atr_now
+            st.entry_price, st.entry_risk = close, cfg.atr_stop_mult * atr_now / close
     if st.side == 0 and cfg.allow_short and (not has_regime or not bull):
         # шорт — только когда рынок в целом падает (если фильтр рынка включён)
         if breakout:
@@ -140,6 +143,7 @@ def update_signal(row: pd.Series, st: SymbolState, cfg: StrategyConfig) -> int:
         if entry:
             st.side, st.extreme_close = -1, close
             st.stop = close + cfg.short_atr_mult * atr_now
+            st.entry_price, st.entry_risk = close, cfg.short_atr_mult * atr_now / close
     return st.side
 
 
@@ -147,6 +151,7 @@ def exit_position(st: SymbolState, cfg: StrategyConfig) -> None:
     st.side = 0
     st.extreme_close = 0.0
     st.stop = 0.0
+    st.entry_price = st.entry_risk = 0.0
     st.cooldown_left = cfg.reentry_cooldown_bars
 
 

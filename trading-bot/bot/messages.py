@@ -8,6 +8,8 @@ REASONS = {
     "trailing_stop": "сработал трейлинг-стоп",
     "drawdown_guard": "защита от просадки",
     "manual_close_all": "команда «закрыть всё»",
+    "challenge_win": "цель попытки достигнута — фиксирую результат",
+    "challenge_bust": "попытка закончена — счёт упал до порога слива",
 }
 
 HELP = (
@@ -91,7 +93,7 @@ def _state_line(snap: dict) -> str:
     if snap.get("guard_paused_left"):
         return f"⏸ пауза защиты, осталось баров: {snap['guard_paused_left']}"
     if not snap.get("regime_ok", True):
-        if snap.get("market") == "futures":
+        if snap.get("allow_short", snap.get("market") == "futures"):
             return "🌧 рынок падает (BTC ниже средней) — бот ищет шорты"
         return "🌧 рынок слабый (фильтр по BTC) — бот вне рынка"
     return "▶️ торгует"
@@ -116,6 +118,42 @@ def _leverage(snap: dict) -> list[str]:
     return [f"Загрузка счёта (плечо): x{snap.get('leverage', 0.0):.2f}"]
 
 
+def _challenge(snap: dict) -> list[str]:
+    ch = snap.get("challenge")
+    if not ch:
+        return []
+    out = [f"🎯 Попытка №{ch['n']}: сейчас x{ch['mult']:.2f}, цель x{ch['target']:g}, "
+           f"слив ниже x{ch['bust']:g}",
+           f"Завершено попыток: побед {ch['won']}, сливов {ch['lost']}"]
+    if ch["won"] + ch["lost"]:
+        out.append(f"Вложено всего {money(ch['spent'])} USDT, возвращено {money(ch['returned'])} USDT")
+    return out
+
+
+def _lessons(snap: dict) -> list[str]:
+    out = [f"🧠 {escape(t)}" for t in snap.get("lessons", [])]
+    if snap.get("blocked"):
+        out.append("Отключены: " + ", ".join(
+            escape(b.replace("|long", " лонг").replace("|short", " шорт")) for b in snap["blocked"]))
+    return ["", "<b>Последние уроки</b>", *out] if out else []
+
+
+def challenge_result(attempt: dict, stake: float, history: list[dict]) -> str:
+    won = sum(a["outcome"] == "win" for a in history)
+    spent, got = stake * len(history), sum(a["final"] for a in history)
+    head = (f"🏆 <b>Цель достигнута!</b> Попытка №{attempt['n']}: {money(stake)} → "
+            f"{money(attempt['final'])} USDT (x{attempt['mult']:.1f}) за {attempt['days']:.0f} дн."
+            if attempt["outcome"] == "win" else
+            f"💥 <b>Попытка №{attempt['n']} слита</b>: от {money(stake)} осталось "
+            f"{money(attempt['final'])} USDT за {attempt['days']:.0f} дн.")
+    return "\n".join([
+        head,
+        f"Всего попыток: {len(history)}, побед {won}, сливов {len(history) - won}",
+        f"Вложено {money(spent)} USDT, возвращено {money(got)} USDT, итог {signed(got - spent)} USDT",
+        f"Начинаю попытку №{attempt['n'] + 1} с {money(stake)} USDT.",
+    ])
+
+
 def status_text(snap: dict) -> str:
     return "\n".join([
         f"<b>Статус</b> · {escape(snap['mode'])} · {escape(snap['exchange'])}",
@@ -123,6 +161,7 @@ def status_text(snap: dict) -> str:
         f"Счёт: <b>{money(snap['equity'])} USDT</b> (кэш {money(snap['cash'])})",
         f"Просадка от пика: {pct(snap['drawdown'], sign=False)}",
         *_leverage(snap),
+        *_challenge(snap),
         "",
         *_positions(snap),
         "",
@@ -143,6 +182,7 @@ def report_text(snap: dict, title: str = "Отчёт") -> str:
         f"С запуска: {pct(snap['total_ret'])} (старт {money(snap['start_equity'])} USDT)",
         f"Просадка от пика: {pct(snap['drawdown'], sign=False)}",
         *_leverage(snap),
+        *_challenge(snap),
         "",
         *_positions(snap),
         "",
@@ -151,6 +191,7 @@ def report_text(snap: dict, title: str = "Отчёт") -> str:
         f"в т.ч. комиссии: {money(st.get('fees', 0.0))} USDT"
         + (f", фандинг: {signed(-st.get('funding', 0.0) or 0.0)} USDT"
            if snap.get("market") == "futures" else ""),
+        *_lessons(snap),
     ])
 
 

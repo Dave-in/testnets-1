@@ -635,3 +635,123 @@ def test_bots_toml_and_configs_load():
     assert all(c.exchange.mode == "paper" for c in cfgs)              # только виртуальные деньги
     trend = load_config(root / "config.trend.toml")
     assert trend.strategy.min_trend_quality == 0.3 and trend.strategy.fast_ema == 10
+
+
+# --- режим попыток (Турбо) и учёт ошибок ---------------------------------------
+
+def test_challenge_attempt_simulation():
+    from bot import challenge
+
+    idx = pd.date_range("2024-01-01", periods=9, freq="1D", tz="UTC")
+    # рост x10 за три бара, затем падение ниже 20%, затем незавершённая попытка
+    eq = pd.Series([1, 3, 6, 12, 6, 2.0, 2.2, 2.4, 2.6], index=idx, dtype=float)
+    att = challenge.sequential_attempts(eq, target=10, bust=0.2)
+    assert [a["outcome"] for a in att] == ["win", "bust", "open"]
+    assert att[0]["final"] == pytest.approx(12.0) and att[1]["final"] == pytest.approx(2 / 12)
+    odds = challenge.start_date_odds(eq, 10, 0.2, horizon_days=3, step_days=1)
+    assert odds["win"] > 0 and odds["win"] + odds["bust"] + odds["open"] == pytest.approx(1.0)
+    assert "побед 1" in challenge.summary_text(eq, 10, 0.2, stake=50)
+
+
+def test_guard_off_never_scales():
+    g = DrawdownGuard(RiskConfig(hard_stop_action="off"), peak=100)
+    assert g.on_bar_close(100) == 1.0 and g.on_bar_close(10) == 1.0
+    assert not g.check_intrabar(1) and not g.active
+
+
+def test_learning_blocks_losing_pair_and_cuts_risk():
+    from bot.core import Decider
+
+    cfg = make_cfg()
+    cfg.strategy.learn_window, cfg.strategy.learn_block_bars = 2, 5
+    cfg.strategy.learn_loss_streak, cfg.strategy.learn_risk_cut = 2, 0.5
+    d = Decider(cfg, 10_000)
+    d._record("ETH/USDT", 1, entry=100.0, risk=0.10, exit_price=90.0)      # −1R
+    assert d.learn["streak"] == 1 and not d.learn["blocked"]
+    d._record("ETH/USDT", 1, entry=100.0, risk=0.10, exit_price=95.0)      # −0.5R → связка в минусе
+    assert d.learn["blocked"] == {"ETH/USDT|long": 5} and d.learn["streak"] == 2
+    lessons = d.pop_lessons()
+    assert any("отключаю" in t for t in lessons) and any("уменьшаю размер" in t for t in lessons)
+    assert d.pop_lessons() == []
+
+    # отключённая связка не открывается, размер после серии минусов урезан вдвое
+    frame = trend_frame()
+    from bot.strategy import prepare
+    row = prepare(frame, cfg.strategy, "1d").iloc[300]
+    rets = pd.DataFrame({"ETH/USDT": np.log(frame["close"]).diff().iloc[270:301]})
+    assert d.on_bar_close({"ETH/USDT": row}, rets, 10_000)["ETH/USDT"] == 0.0
+    d.learn["blocked"].clear()
+    cut = d.on_bar_close({"ETH/USDT": row}, rets, 10_000)["ETH/USDT"]
+    d2 = Decider(make_cfg(), 10_000)
+    full = d2.on_bar_close({"ETH/USDT": row}, rets, 10_000)["ETH/USDT"]
+    assert full > 0 and cut == pytest.approx(full * 0.5)
+    d._record("ETH/USDT", 1, entry=100.0, risk=0.10, exit_price=130.0)     # прибыль → серия сброшена
+    assert d.learn["streak"] == 0
+    # состояние уроков переживает перезапуск
+    d3 = Decider(cfg, 10_000)
+    d3.load_dict(json.loads(json.dumps(d.to_dict())))
+    assert d3.learn["hist"] == d.learn["hist"]
+
+
+def turbo_cfg() -> Config:
+    cfg = futures_cfg()
+    cfg.strategy.allow_short = False
+    cfg.portfolio.initial_capital = 50.0
+    cfg.portfolio.max_gross_exposure = 5.0
+    cfg.portfolio.profiles = {"core": {"ETH/USDT": 5.0}}
+    cfg.strategy.target_vol = 1000.0
+    cfg.strategy.risk_per_trade = 0.2
+    cfg.risk.hard_stop_action = "off"
+    cfg.challenge.enabled = True
+    return cfg
+
+
+def test_challenge_win_and_bust_restart_attempt(tmp_path):
+    cfg = turbo_cfg()
+    market = FakeMarket({"ETH/USDT": trend_frame()})
+    note = FakeNotifier()
+    runner = Runner(cfg, market, PaperBroker(0.0005, 0.0005), tmp_path / "t.json", note)
+    for _ in range(40):
+        runner.step()
+        market.i += 1
+    assert runner.book.units["ETH/USDT"] > 0                      # в позиции с плечом
+    assert runner.snapshot["leverage"] > 1.0
+    assert runner.snapshot["challenge"]["n"] == 1
+
+    # победа: счёт вырос в 10 раз → позиции закрыты, новая попытка с 50 USDT
+    px = market.prices(["ETH/USDT"])
+    runner.book.cash += 50.0 * 10
+    runner.check_challenge(px)
+    assert runner.attempts[-1]["outcome"] == "win" and runner.attempts[-1]["mult"] >= 10
+    assert runner.attempt["n"] == 2 and runner.book.cash == 50.0
+    assert runner.book.units["ETH/USDT"] == 0
+    assert any("Цель достигнута" in m for m in note.sent)
+
+    # слив: осталось меньше 20% → попытка закрыта, начата третья
+    runner.book.cash = 9.0
+    runner.check_challenge(px)
+    assert [a["outcome"] for a in runner.attempts] == ["win", "bust"]
+    assert runner.attempt["n"] == 3 and runner.book.cash == 50.0
+    assert any("слита" in m and "побед 1, сливов 1" in m for m in note.sent)
+
+    runner.step()
+    ch = runner.snapshot["challenge"]
+    assert ch["won"] == 1 and ch["lost"] == 1 and ch["spent"] == 150.0
+    from bot import messages
+    assert "Попытка №3" in messages.status_text(runner.snapshot)
+    again = Runner(cfg, market, PaperBroker(0.0005, 0.0005), tmp_path / "t.json")
+    assert again.attempt["n"] == 3 and len(again.attempts) == 2   # история попыток сохраняется
+
+
+def test_turbo_config_is_paper_only_and_bounded():
+    from pathlib import Path
+
+    from bot.config import load_config
+    from bot.group import load_group
+
+    root = Path(__file__).resolve().parents[1]
+    cfg = load_config(root / "config.turbo.toml")
+    assert cfg.exchange.mode == "paper" and cfg.exchange.market == "futures"
+    assert cfg.challenge.enabled and cfg.challenge.target_mult == 10
+    assert cfg.portfolio.max_gross_exposure <= 5.0 and cfg.portfolio.initial_capital == 50.0
+    assert any(s.config == "config.turbo.toml" for s in load_group(root / "bots.toml"))
