@@ -12,6 +12,9 @@ REPO="${BOT_REPO:-https://github.com/Dave-in/testnets-1.git}"
 BRANCH="${BOT_BRANCH:-claude/trading-bot-exchanges-pp8kid}"
 DIR="${BOT_DIR:-$HOME/trading-bot-app}"
 SERVICE=trading-bot
+# Какой бот запускать: config.futures.toml — активный, лонги и шорты на фьючерсах (по умолчанию);
+# config.signals.toml — спокойный, только покупки на споте. Пример: BOT_CONFIG=config.signals.toml
+CONFIG="${BOT_CONFIG:-config.futures.toml}"
 say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 die() { printf '\nОШИБКА: %s\n' "$*" >&2; exit 1; }
 
@@ -50,7 +53,7 @@ if ! grep -q '^TELEGRAM_CHAT_ID=.\+' .env; then
   if [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
     printf 'TELEGRAM_CHAT_ID=%s\n' "$TELEGRAM_CHAT_ID" >> .env
   else
-    .venv/bin/python -m bot --config config.signals.toml tg-setup --wait 600 \
+    .venv/bin/python -m bot --config $CONFIG tg-setup --wait 600 \
       || die "не удалось связаться с вами в Telegram — отправьте боту /start и запустите установку ещё раз"
   fi
 fi
@@ -58,10 +61,10 @@ fi
 say "4/4 Запуск"
 if [ "${BOT_NO_SERVICE:-0}" = 1 ]; then
   echo "Сервис не ставлю (BOT_NO_SERVICE=1). Ручной запуск:"
-  echo "  cd $DIR/trading-bot && .venv/bin/python -m bot --config config.signals.toml run"
+  echo "  cd $DIR/trading-bot && .venv/bin/python -m bot --config $CONFIG run"
   exit 0
 fi
-command -v systemctl >/dev/null || die "нет systemd. Запустите вручную в tmux:  cd $DIR/trading-bot && .venv/bin/python -m bot --config config.signals.toml run"
+command -v systemctl >/dev/null || die "нет systemd. Запустите вручную в tmux:  cd $DIR/trading-bot && .venv/bin/python -m bot --config $CONFIG run"
 SUDO=""; [ "$(id -u)" = 0 ] || SUDO="sudo"
 $SUDO tee /etc/systemd/system/$SERVICE.service >/dev/null <<UNIT
 [Unit]
@@ -72,7 +75,7 @@ Wants=network-online.target
 [Service]
 User=$(id -un)
 WorkingDirectory=$DIR/trading-bot
-ExecStart=$DIR/trading-bot/.venv/bin/python -m bot --config config.signals.toml run
+ExecStart=$DIR/trading-bot/.venv/bin/python -m bot --config $CONFIG run
 Restart=always
 RestartSec=15
 
@@ -85,7 +88,7 @@ $SUDO systemctl restart $SERVICE
 sleep 5
 $SUDO systemctl is-active -q $SERVICE || { $SUDO journalctl -u $SERVICE -n 30 --no-pager; die "бот не запустился, лог выше"; }
 
-say "Готово: бот работает и переживёт перезагрузку сервера."
+say "Готово: бот ($CONFIG) работает и переживёт перезагрузку сервера."
 cat <<TXT
 В Telegram должно прийти «Бот запущен». Команды боту: /status /report /pause /resume /closeall
 На сервере:

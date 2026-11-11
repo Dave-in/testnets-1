@@ -71,12 +71,21 @@ def cmd_download(args) -> None:
                                      | set(_symbols_with_regime(cfg)))
     data.download(cfg.exchange.name, symbols, cfg.exchange.timeframe, args.since, args.until,
                   args.data_dir)
+    if cfg.exchange.market == "futures":
+        data.download_funding(args.symbols or cfg.portfolio.symbols,
+                              max(args.since, "2019-09-01"), args.data_dir)
+
+
+def _funding(cfg: Config, args) -> dict:
+    if cfg.exchange.market != "futures" or args.synthetic:
+        return {}
+    return data.load_funding(args.data_dir, cfg.portfolio.symbols)
 
 
 def cmd_backtest(args) -> None:
     cfg = _cfg(args)
     frames = _load_data(cfg, args)
-    res = Backtester(cfg, frames, trade_start=args.start).run()
+    res = Backtester(cfg, frames, trade_start=args.start, funding=_funding(cfg, args)).run()
     title = (f"Бэктест: {cfg.exchange.name} {cfg.exchange.timeframe}, профиль "
              f"{cfg.portfolio.profile} ({', '.join(cfg.portfolio.symbols)})"
              + (" — СИНТЕТИКА" if args.synthetic else ""))
@@ -95,7 +104,7 @@ def cmd_walkforward(args) -> None:
     должна оставаться в рамках лимита во всех."""
     cfg = _cfg(args)
     frames = _load_data(cfg, args)
-    full = Backtester(cfg, frames, trade_start=args.start).run()
+    full = Backtester(cfg, frames, trade_start=args.start, funding=_funding(cfg, args)).run()
     eq = full.equity["equity"]
     ppy = periods_per_year(cfg.exchange.timeframe)
     print(f"{'Окно':<26}{'Доходн.':>10}{'Макс.просадка':>16}{'Sharpe':>9}")

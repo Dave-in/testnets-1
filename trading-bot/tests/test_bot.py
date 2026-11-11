@@ -361,3 +361,162 @@ def test_binance_public_falls_back_to_mirror():
     assert pub.hosts[0] == "https://mirror"           # рабочий адрес запомнили
     with pytest.raises(RuntimeError):
         pub.prices(["NOPE/USDT"])
+
+
+# --- фьючерсы: шорты, риск на сделку, фандинг ---------------------------------
+
+def mirror(df: pd.DataFrame) -> pd.DataFrame:
+    """Зеркальный рынок: там, где исходный рос, этот падает (и наоборот)."""
+    k = 100.0 * 300.0
+    return pd.DataFrame({"open": k / df["open"], "high": k / df["low"], "low": k / df["high"],
+                         "close": k / df["close"], "volume": df["volume"]}, index=df.index)
+
+
+def futures_cfg() -> Config:
+    cfg = make_cfg()
+    cfg.exchange.market = "futures"
+    cfg.exchange.fee = 0.0005
+    cfg.strategy.allow_short = True
+    return cfg
+
+
+def test_shorts_require_futures():
+    cfg = make_cfg()
+    cfg.strategy.allow_short = True
+    with pytest.raises(ValueError):
+        Backtester(cfg, {"ETH/USDT": trend_frame()})
+
+
+def test_backtest_shorts_profit_in_downtrend():
+    cfg = futures_cfg()
+    res = Backtester(cfg, {"ETH/USDT": mirror(trend_frame())}).run()
+    w, eq = res.equity["w_ETH/USDT"], res.equity["equity"]
+    fall_end = trend_frame().index[449]              # до этого бара рынок падает
+    assert w[:fall_end].min() < 0 and w[:fall_end].max() <= 1e-9   # в падении — только шорты
+    assert eq[:fall_end].iloc[-1] > cfg.portfolio.initial_capital  # и на падении заработали
+    assert w.iloc[-1] >= 0                           # после разворота вверх шорта уже нет
+
+
+def test_risk_per_trade_caps_position_size():
+    from bot.strategy import size_weights
+
+    cfg = futures_cfg()
+    cfg.strategy.target_vol = 10.0                   # волатильность не ограничивает
+    cfg.strategy.risk_per_trade = 0.01
+    rets = pd.DataFrame({"A": [0.0] * 30, "B": [0.0] * 30})
+    w = size_weights({"A": 1, "B": -1}, {"A": 0.5, "B": 0.5}, {"A": 0.10, "B": 0.05}, rets,
+                     {"A": 1.0, "B": 1.0}, cfg.strategy, "1d", max_gross=5.0)
+    assert w["A"] == pytest.approx(0.10)             # 1% риска / 10% до стопа
+    assert w["B"] == pytest.approx(-0.20)            # шорт со знаком минус
+    cfg.strategy.short_scale = 0.5
+    w = size_weights({"B": -1}, {"B": 0.5}, {"B": 0.05}, rets, {"B": 1.0}, cfg.strategy, "1d", 5.0)
+    assert w["B"] == pytest.approx(-0.10)
+    w = size_weights({"A": 1, "B": -1}, {"A": 0.5, "B": 0.5}, {"A": 0.001, "B": 0.001}, rets,
+                     {"A": 1.0, "B": 1.0}, cfg.strategy, "1d", max_gross=1.0)
+    assert sum(abs(x) for x in w.values()) == pytest.approx(1.0)   # общее плечо не выше лимита
+
+
+def test_stops_for_longs_and_shorts():
+    from bot.core import Decider
+
+    d = Decider(futures_cfg(), 10_000)
+    st = d.states["ETH/USDT"]
+    st.side, st.stop = -1, 110.0
+    assert d.check_stops({"ETH/USDT": 90.0}, {"ETH/USDT": -1.0}, {"ETH/USDT": 109.0}) == []
+    assert d.check_stops({"ETH/USDT": 90.0}, {"ETH/USDT": -1.0}, {"ETH/USDT": 111.0}) == ["ETH/USDT"]
+    st.side, st.stop = 1, 95.0
+    assert d.check_stops({"ETH/USDT": 96.0}, {"ETH/USDT": 1.0}, {"ETH/USDT": 120.0}) == []
+    assert d.check_stops({"ETH/USDT": 94.0}, {"ETH/USDT": 1.0}, {"ETH/USDT": 120.0}) == ["ETH/USDT"]
+
+
+def test_rebalance_handles_shorts_and_flips():
+    assert rebalance_deltas({"A": -0.10}, {"A": 0.0}, 0.2) == {"A": -0.10}     # открыть шорт
+    assert rebalance_deltas({"A": -0.11}, {"A": -0.10}, 0.2) == {}             # мелочь
+    assert rebalance_deltas({"A": 0.0}, {"A": -0.10}, 0.2) == {"A": 0.0}       # закрыть шорт
+    assert rebalance_deltas({"A": 0.01}, {"A": -0.10}, 0.9) == {"A": 0.01}     # переворот всегда
+
+
+def test_funding_reduces_long_and_pays_short():
+    idx = trend_frame().index
+    rate = pd.Series(0.001, index=idx)               # 0.1% за бар — заметно
+    cfg = futures_cfg()
+    cfg.strategy.allow_short = False                 # сначала только лонги
+    base = Backtester(cfg, {"ETH/USDT": trend_frame()}, funding={}).run()
+    cfg.exchange.default_funding_8h = 0.0
+    free = Backtester(cfg, {"ETH/USDT": trend_frame()}, funding={}).run()
+    paid = Backtester(cfg, {"ETH/USDT": trend_frame()}, funding={"ETH/USDT": rate}).run()
+    assert paid.metrics["funding_paid"] > 0
+    assert paid.equity["equity"].iloc[-1] < free.equity["equity"].iloc[-1]
+    assert base.metrics["funding_paid"] > 0          # без истории лонги платят типовую ставку
+    cfg.strategy.allow_short = True
+    falling = mirror(trend_frame()).iloc[:450]       # только падение: бот всё время в шорте
+    short = Backtester(cfg, {"ETH/USDT": falling}, funding={"ETH/USDT": rate}).run()
+    assert short.metrics["funding_paid"] < 0         # шорт получает положительную ставку
+
+
+class FundingMarket(FakeMarket):
+    rates = {"ETH/USDT": 0.001}
+
+    def funding_rates(self, symbols):
+        return {s: self.rates[s] for s in symbols if s in self.rates}
+
+
+def test_futures_runner_shorts_signals_and_funding(tmp_path, monkeypatch):
+    import bot.live as live
+
+    cfg = futures_cfg()
+    market = FundingMarket({"ETH/USDT": mirror(trend_frame())})
+    note = FakeNotifier()
+    runner = Runner(cfg, market, PaperBroker(0.0005, 0.0005), tmp_path / "f.json", note)
+    for _ in range(60):
+        runner.step()
+        market.i += 1
+    assert runner.book.units["ETH/USDT"] < 0
+    opened = [m for m in note.sent if "ОТКРЫТЬ ШОРТ ETH/USDT" in m]
+    assert opened and "Стоп:" in opened[0] and "Риск по позиции до стопа" in opened[0]
+    assert runner.snapshot["positions"][0]["side"] == -1 and runner.snapshot["market"] == "futures"
+    assert "ШОРТ" in __import__("bot.messages", fromlist=["x"]).status_text(runner.snapshot)
+
+    # фандинг: прошёл один 8-часовой период → шорт получает положительную ставку
+    cash0, now = runner.book.cash, live.time.time()
+    monkeypatch.setattr(live.time, "time", lambda: now + 8 * 3600)
+    prices = market.prices(["ETH/USDT"])
+    runner.apply_funding(prices)
+    expected = runner.book.units["ETH/USDT"] * prices["ETH/USDT"] * 0.001   # отрицательное число
+    assert runner.book.cash - cash0 == pytest.approx(-expected) and expected < 0
+    assert runner.stats["funding"] == pytest.approx(expected)
+    runner.apply_funding(prices)                     # тот же период — второй раз не начисляем
+    assert runner.stats["funding"] == pytest.approx(expected)
+    monkeypatch.setattr(live.time, "time", lambda: now)
+
+    for _ in range(180):                             # разворот вверх → шорт закрывается
+        runner.step()
+        market.i += 1
+    assert runner.book.units["ETH/USDT"] >= 0        # шорта больше нет (бот мог уйти в лонг)
+    assert any("ЗАКРЫТЬ ШОРТ ETH/USDT" in m and "Итог сделки" in m for m in note.sent)
+    assert runner.stats["closed"] >= 1
+    # учёт сходится: капитал = старт + зафиксированное (минус комиссии и фандинг) + бумажный результат
+    prices = market.prices(["ETH/USDT"])
+    u, entry = runner.book.units["ETH/USDT"], runner.book.entry["ETH/USDT"]
+    unrealized = u * (prices["ETH/USDT"] - entry)
+    assert runner.book.equity(prices) == pytest.approx(
+        cfg.portfolio.initial_capital + runner.stats["realized"] + unrealized)
+
+
+def test_state_from_version_without_shorts_still_loads(tmp_path):
+    from bot.strategy import SymbolState
+
+    st = SymbolState.from_dict({"in_position": True, "highest_close": 120.0, "stop": 100.0,
+                                "cooldown_left": 0})
+    assert st.side == 1 and st.extreme_close == 120.0 and st.in_position
+    cfg = make_cfg()
+    path = tmp_path / "old.json"
+    path.write_text(json.dumps({
+        "book": {"cash": 4000.0, "units": {"ETH/USDT": 2.0}, "cost": {"ETH/USDT": 6000.0}},
+        "decider": {"states": {"ETH/USDT": {"in_position": True, "highest_close": 3100.0,
+                                            "stop": 2800.0, "cooldown_left": 0}},
+                    "guard": {"peak": 10000.0, "paused_left": 0, "halted": False, "events": []}},
+        "last_bar": None}))
+    r = Runner(cfg, FakeMarket({"ETH/USDT": trend_frame()}), PaperBroker(0.001, 0.0005), path)
+    assert r.book.entry["ETH/USDT"] == pytest.approx(3000.0)
+    assert r.decider.states["ETH/USDT"].side == 1

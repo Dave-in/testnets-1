@@ -30,8 +30,12 @@ class BacktestResult:
 
 
 class Backtester:
-    def __init__(self, cfg: Config, data: dict[str, pd.DataFrame], trade_start: str | None = None):
+    def __init__(self, cfg: Config, data: dict[str, pd.DataFrame], trade_start: str | None = None,
+                 funding: dict[str, pd.Series] | None = None):
         self.cfg = cfg
+        self.futures = cfg.exchange.market == "futures"
+        if cfg.strategy.allow_short and not self.futures:
+            raise ValueError('Шорты возможны только при [exchange] market = "futures"')
         self.symbols = cfg.portfolio.symbols
         missing = [s for s in self.symbols if s not in data]
         if missing:
@@ -50,6 +54,8 @@ class Backtester:
         )
         self.close_ff = pd.DataFrame({s: df["close"] for s, df in self.frames.items()}).ffill()
 
+        self.funding_bar = self._funding_per_bar(funding or {})
+
         first_ready = min(df["ema_slow"].first_valid_index() for df in prepared.values())
         start = first_ready
         if trade_start:
@@ -58,44 +64,56 @@ class Backtester:
         if self.start_i >= len(self.index) - 1:
             raise ValueError("Слишком мало данных: не хватает истории для прогрева индикаторов")
 
+    def _funding_per_bar(self, funding: dict[str, pd.Series]) -> pd.DataFrame:
+        """Суммарная ставка фандинга за каждый бар (NaN — истории нет)."""
+        out = pd.DataFrame(index=self.index, columns=self.symbols, dtype=float)
+        step = self.index[1] - self.index[0]
+        for s, rates in funding.items():
+            if s in out.columns and len(rates):
+                bars = rates.index.floor(step)
+                out[s] = rates.groupby(bars).sum().reindex(self.index)
+                # внутри периода, где история есть, пропуск = выплат не было
+                inside = (self.index >= rates.index[0]) & (self.index <= rates.index[-1])
+                out.loc[inside, s] = out.loc[inside, s].fillna(0.0)
+        self._default_funding = self.cfg.exchange.default_funding_8h * (step / pd.Timedelta(hours=8))
+        return out
+
     # --- исполнение -------------------------------------------------------
-    def _trade(self, ts, sym, units, price, side_mult, reason):
-        """units > 0 — покупка, < 0 — продажа. Возвращает изменение кэша."""
+    def _trade(self, ts, sym, units, price, reason):
+        """units > 0 — покупка, < 0 — продажа (в т.ч. открытие шорта)."""
+        if units == 0:
+            return
         ex = self.cfg.exchange
-        fill = price * (1 + side_mult * ex.slippage)
+        fill = price * (1 + np.sign(units) * ex.slippage)
         notional = abs(units) * fill
         fee = notional * ex.fee
         self.trades.append({"ts": ts, "symbol": sym, "side": "buy" if units > 0 else "sell",
                             "units": abs(units), "price": fill, "notional": notional,
                             "fee": fee, "reason": reason})
-        return -units * fill - fee
+        self.cash += -units * fill - fee
+        self.units[sym] += units
 
-    def _sell_all(self, ts, sym, price, reason):
-        if self.units[sym] > 0:
-            self.cash += self._trade(ts, sym, -self.units[sym], price, -1, reason)
-            self.units[sym] = 0.0
+    def _close(self, ts, sym, price, reason):
+        self._trade(ts, sym, -self.units[sym], price, reason)
+        self.units[sym] = 0.0
+
+    def _equity(self, prices) -> float:
+        return self.cash + sum(u * prices[s] for s, u in self.units.items() if u)
 
     def _rebalance(self, ts, targets: dict[str, float], prices: dict[str, float]):
-        equity = self.cash + sum(self.units[s] * prices[s] for s in self.symbols
-                                 if self.units[s] > 0)
-        # сначала продажи, потом покупки — чтобы хватило кэша
+        equity = self._equity(prices)
+        # сначала продажи, потом покупки — на споте иначе может не хватить кэша
         order = sorted(targets, key=lambda s: targets[s] * equity - self.units[s] * prices[s])
         for s in order:
             p = prices.get(s)
             if p is None or np.isnan(p):
                 continue
-            delta_units = (targets[s] * equity - self.units[s] * p) / p
-            if delta_units < 0:
-                delta_units = max(delta_units, -self.units[s])
-                self.cash += self._trade(ts, s, delta_units, p, -1, "rebalance")
-                self.units[s] += delta_units
-            elif delta_units > 0:
+            delta = (targets[s] * equity - self.units[s] * p) / p
+            if not self.futures:
                 ex = self.cfg.exchange
-                max_units = self.cash / (p * (1 + ex.slippage) * (1 + ex.fee))
-                delta_units = min(delta_units, max_units)
-                if delta_units > 0:
-                    self.cash += self._trade(ts, s, delta_units, p, +1, "rebalance")
-                    self.units[s] += delta_units
+                delta = max(delta, -self.units[s])  # на споте нельзя продать больше, чем есть
+                delta = min(delta, self.cash / (p * (1 + ex.slippage) * (1 + ex.fee)))
+            self._trade(ts, s, delta, p, "rebalance")
 
     # --- основной цикл ----------------------------------------------------
     def run(self) -> BacktestResult:
@@ -104,10 +122,12 @@ class Backtester:
         self.cash = capital
         self.units = {s: 0.0 for s in self.symbols}
         self.trades: list[dict] = []
+        self.funding_total = 0.0
         decider = Decider(cfg, capital)
         pending: dict[str, float] | None = None
         records = []
         lookback = cfg.strategy.vol_lookback
+        liquidated = False
 
         for i in range(self.start_i, len(self.index)):
             ts = self.index[i]
@@ -117,34 +137,57 @@ class Backtester:
                      for s in self.symbols}
 
             # 1) исполняем решения, принятые на прошлом закрытии
-            if pending:
+            if pending and not liquidated:
                 self._rebalance(ts, pending, opens)
-                pending = None
+            pending = None
 
-            # 2) трейлинг-стопы внутри бара
+            # 2) трейлинг-стопы внутри бара (лонг выбивает минимум, шорт — максимум;
+            #    при гэпе за стоп выходим по цене открытия, то есть хуже стопа)
             lows = {s: bar[s]["low"] for s in self.symbols if not np.isnan(bar[s]["low"])}
-            for s in decider.check_stops(lows, self.units):
+            highs = {s: bar[s]["high"] for s in self.symbols if not np.isnan(bar[s]["high"])}
+            for s in decider.check_stops(lows, self.units, highs):
                 stop = decider.states[s].stop
-                self._sell_all(ts, s, min(opens[s], stop), "trailing_stop")
+                px = min(opens[s], stop) if self.units[s] > 0 else max(opens[s], stop)
+                self._close(ts, s, px, "trailing_stop")
                 decider.on_stop_hit(s)
 
-            # 3) жесткий лимит просадки внутри бара
-            held = [s for s in self.symbols if self.units[s] > 0]
+            # 3) худший случай внутри бара: ликвидация и жесткий лимит просадки
+            held = [s for s in self.symbols if self.units[s]]
             if held:
+                worst = {s: (lows if self.units[s] > 0 else highs).get(s, opens[s]) for s in held}
                 eq_open = self.cash + sum(self.units[s] * opens[s] for s in held)
-                eq_low = self.cash + sum(self.units[s] * lows.get(s, opens[s]) for s in held)
-                if decider.guard.check_intrabar(eq_low, ts):
+                eq_worst = self.cash + sum(self.units[s] * worst[s] for s in held)
+                if eq_worst <= 0:  # плечо слишком велико: счёт обнулён
+                    for s in held:
+                        self._close(ts, s, worst[s], "liquidation")
+                    self.cash = max(self.cash, 0.0)
+                    decider.guard.halted = liquidated = True
+                    decider.guard.events.append({"ts": ts, "event": "liquidation", "equity": 0.0,
+                                                 "drawdown": 1.0})
+                    decider.reset_signals()
+                elif decider.guard.check_intrabar(eq_worst, ts):
                     threshold = decider.guard.peak * (1 - cfg.risk.hard_drawdown)
-                    lam = 0.0 if eq_open <= eq_low else (eq_open - threshold) / (eq_open - eq_low)
+                    lam = 0.0 if eq_open <= eq_worst else (eq_open - threshold) / (eq_open - eq_worst)
                     lam = float(np.clip(lam, 0.0, 1.0))
                     for s in held:
-                        px = opens[s] + lam * (lows.get(s, opens[s]) - opens[s])
-                        self._sell_all(ts, s, px, "drawdown_guard")
+                        self._close(ts, s, opens[s] + lam * (worst[s] - opens[s]), "drawdown_guard")
                     decider.reset_signals()
 
-            # 4) закрытие бара: оценка капитала и новое решение
-            equity = self.cash + sum(self.units[s] * last_close[s] for s in self.symbols
-                                     if self.units[s] > 0)
+            # 4) фандинг (только фьючерсы): лонг платит положительную ставку, шорт получает
+            if self.futures:
+                for s, u in self.units.items():
+                    if not u:
+                        continue
+                    rate = self.funding_bar[s].iloc[i]
+                    if np.isnan(rate):  # истории нет: лонги платят типовую ставку, шорты — ноль
+                        pay = max(u, 0.0) * last_close[s] * self._default_funding
+                    else:
+                        pay = u * last_close[s] * rate
+                    self.cash -= pay
+                    self.funding_total += pay
+
+            # 5) закрытие бара: оценка капитала и новое решение
+            equity = self._equity(last_close)
             rows = {s: bar[s] for s in self.symbols}
             rets = self.logret.iloc[max(0, i - lookback + 1): i + 1]
             targets = decider.on_bar_close(rows, rets, equity, ts)
@@ -154,7 +197,8 @@ class Backtester:
                                        cfg.strategy.min_trade)
 
             rec = {"ts": ts, "equity": equity, "cash": self.cash,
-                   "exposure": 1 - self.cash / equity if equity > 0 else 0.0,
+                   "exposure": sum(abs(w) for w in current.values()),
+                   "net_exposure": sum(current.values()),
                    "guard_peak": decider.guard.peak}
             rec.update({f"w_{s}": current[s] for s in self.symbols})
             records.append(rec)
@@ -165,6 +209,8 @@ class Backtester:
         ppy = periods_per_year(cfg.exchange.timeframe)
         m = metrics.compute(eq["equity"], ppy, trades, eq["exposure"],
                             cfg.portfolio.monthly_target)
+        if self.futures:
+            m["funding_paid"] = float(self.funding_total)
         return BacktestResult(eq, trades, decider.guard.events, m, self._benchmarks(eq.index, ppy))
 
     def _benchmarks(self, idx: pd.DatetimeIndex, ppy: int) -> dict[str, dict]:

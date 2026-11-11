@@ -61,12 +61,15 @@ class Runner:
         self.state_path = Path(state_path)
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self.decider = Decider(cfg, cfg.portfolio.initial_capital)
+        self.futures = cfg.exchange.market == "futures"
         self.book = Book(cash=cfg.portfolio.initial_capital, units={s: 0.0 for s in self.symbols},
-                         cost={s: 0.0 for s in self.symbols})
+                         entry={s: 0.0 for s in self.symbols})
+        self.last_funding = -1       # номер последнего обработанного 8-часового периода фандинга
         self.pos_pnl = {s: 0.0 for s in self.symbols}   # зафиксировано по текущей позиции
         self.pos_invested = {s: 0.0 for s in self.symbols}  # всего вложено в текущую позицию
         self._prices: dict[str, float] = {}
-        self.stats = {"closed": 0, "wins": 0, "realized": 0.0, "fees": 0.0}
+        # realized — чистый результат: прибыль/убыток сделок минус комиссии и фандинг
+        self.stats = {"closed": 0, "wins": 0, "realized": 0.0, "fees": 0.0, "funding": 0.0}
         self.marks: dict = {}        # капитал на начало дня/месяца — для отчётов
         self.regime_ok = True
         self.snapshot: dict = {}
@@ -84,9 +87,13 @@ class Runner:
             log.info("Новый запуск. Капитал бота: %.2f USDT", self.book.cash)
             return
         st = json.loads(self.state_path.read_text())
-        self.book = Book(cash=st["book"]["cash"],
-                         units={s: st["book"]["units"].get(s, 0.0) for s in self.symbols},
-                         cost={s: st["book"].get("cost", {}).get(s, 0.0) for s in self.symbols})
+        units = {s: st["book"]["units"].get(s, 0.0) for s in self.symbols}
+        entry = {s: st["book"].get("entry", {}).get(s, 0.0) for s in self.symbols}
+        for s, cost in st["book"].get("cost", {}).items():  # формат до появления шортов
+            if s in units and units[s] > 0 and not entry[s]:
+                entry[s] = cost / units[s]
+        self.book = Book(cash=st["book"]["cash"], units=units, entry=entry)
+        self.last_funding = st.get("last_funding", -1)
         self.pos_pnl.update({s: v for s, v in st.get("pos_pnl", {}).items() if s in self.pos_pnl})
         self.pos_invested.update({s: v for s, v in st.get("pos_invested", {}).items()
                                   if s in self.pos_invested})
@@ -102,7 +109,8 @@ class Runner:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path.with_suffix(".tmp")
         tmp.write_text(json.dumps({
-            "book": {"cash": self.book.cash, "units": self.book.units, "cost": self.book.cost},
+            "book": {"cash": self.book.cash, "units": self.book.units, "entry": self.book.entry},
+            "last_funding": self.last_funding,
             "pos_pnl": self.pos_pnl,
             "pos_invested": self.pos_invested,
             "stats": self.stats,
@@ -127,40 +135,48 @@ class Runner:
 
     # --- торговля ---------------------------------------------------------
     def _execute(self, symbol: str, side: str, units: float, price: float, reason: str) -> None:
+        """Одна сделка в одну сторону (без переворота позиции — см. _trade_to)."""
         if units <= 0:
             return
-        if side == "buy":
-            ex = self.cfg.exchange
-            units = min(units, self.book.cash / (price * (1 + ex.slippage) * (1 + ex.fee)))
-        else:
-            units = min(units, self.book.units[symbol])
+        before = self.book.units[symbol]
+        sign = 1 if side == "buy" else -1
+        if not self.futures:  # спот: покупаем на кэш, продаём только то, что есть
+            if side == "buy":
+                ex = self.cfg.exchange
+                units = min(units, self.book.cash / (price * (1 + ex.slippage) * (1 + ex.fee)))
+            else:
+                units = min(units, max(before, 0.0))
+        elif before * sign < 0:  # фьючерсы: сокращение не должно проскочить через ноль
+            units = min(units, abs(before))
         fill = self.broker.market_order(symbol, side, units, price)
         if fill is None:
             return
-        before = self.book.units[symbol]
+
+        self.book.cash += -fill.cost if side == "buy" else fill.cost
+        after = before + sign * fill.units
         pnl = position_pnl = position_ret = None
-        if side == "buy":
-            self.book.cash -= fill.cost
-            self.book.units[symbol] += fill.units
-            self.book.cost[symbol] += fill.cost
-            self.pos_invested[symbol] += fill.cost
-        else:
-            sold_cost = self.book.cost[symbol] * min(1.0, fill.units / before) if before > 0 else 0.0
-            pnl = fill.cost - sold_cost
-            self.book.cash += fill.cost
-            self.book.units[symbol] = max(0.0, before - fill.units)
-            self.book.cost[symbol] -= sold_cost
+        self.pos_pnl[symbol] -= fill.fee
+        self.stats["realized"] -= fill.fee
+        self.stats["fees"] += fill.fee
+        if before == 0 or before * sign > 0:   # открытие или увеличение позиции
+            total = abs(before) + fill.units
+            self.book.entry[symbol] = (abs(before) * self.book.entry[symbol]
+                                       + fill.units * fill.price) / total
+            self.pos_invested[symbol] += fill.units * fill.price
+        else:                                   # сокращение или закрытие
+            closed = min(fill.units, abs(before))
+            pnl = (1 if before > 0 else -1) * (fill.price - self.book.entry[symbol]) * closed
             self.pos_pnl[symbol] += pnl
             self.stats["realized"] += pnl
-            if self.book.units[symbol] * price < 1.0:  # пыль после округления → позиция закрыта
-                invested = self.pos_invested[symbol]
-                position_pnl = self.pos_pnl[symbol]
-                position_ret = position_pnl / invested if invested > 0 else None
-                self.stats["closed"] += 1
-                self.stats["wins"] += position_pnl > 0
-                self.book.units[symbol] = self.book.cost[symbol] = 0.0
-                self.pos_pnl[symbol] = self.pos_invested[symbol] = 0.0
-        self.stats["fees"] += fill.fee
+        if abs(after) * price < 1.0 and before != 0:  # пыль после округления → позиция закрыта
+            invested = self.pos_invested[symbol]
+            position_pnl = self.pos_pnl[symbol]
+            position_ret = position_pnl / invested if invested > 0 else None
+            self.stats["closed"] += 1
+            self.stats["wins"] += position_pnl > 0
+            after = self.book.entry[symbol] = 0.0
+            self.pos_pnl[symbol] = self.pos_invested[symbol] = 0.0
+        self.book.units[symbol] = after
         self._dirty = True
         log.info("%s %s %.6f @ %.4f (комиссия %.4f) — %s",
                  side.upper(), symbol, fill.units, fill.price, fill.fee, reason)
@@ -172,10 +188,24 @@ class Runner:
         equity = self.book.cash + sum(u * prices.get(s, 0.0) for s, u in self.book.units.items())
         self._notify(messages.trade_message(
             symbol=symbol, side=side, fill_price=fill.price, notional=fill.units * fill.price,
-            reason=reason, units_before=before, units_after=self.book.units[symbol],
-            equity=equity, weight_after=self.book.units[symbol] * price / equity if equity else 0,
+            reason=reason, units_before=before, units_after=after,
+            equity=equity, weight_after=abs(after) * price / equity if equity else 0,
             stop=self.decider.states[symbol].stop, position_pnl=position_pnl,
-            position_ret=position_ret, virtual=self.cfg.exchange.mode != "live"))
+            position_ret=position_ret, virtual=self.cfg.exchange.mode != "live",
+            futures=self.futures))
+
+    def _trade_to(self, symbol: str, target_units: float, price: float, reason: str) -> None:
+        """Привести позицию к целевой (со знаком). Переворот лонг ↔ шорт — двумя сделками."""
+        cur = self.book.units[symbol]
+        if cur * target_units < 0:
+            self._close(symbol, price, reason)
+            cur = self.book.units[symbol]
+        diff = target_units - cur
+        self._execute(symbol, "buy" if diff > 0 else "sell", abs(diff), price, reason)
+
+    def _close(self, symbol: str, price: float, reason: str) -> None:
+        u = self.book.units[symbol]
+        self._execute(symbol, "sell" if u > 0 else "buy", abs(u), price, reason)
 
     def _notify(self, text: str) -> None:
         if self.notifier is None:
@@ -185,13 +215,10 @@ class Runner:
         except Exception:  # noqa: BLE001 — уведомления не должны ронять торговлю
             log.exception("Не удалось отправить уведомление")
 
-    def _sell_all(self, symbol: str, price: float, reason: str) -> None:
-        self._execute(symbol, "sell", self.book.units[symbol], price, reason)
-
     def check_risk(self, prices: dict[str, float]) -> None:
         """Трейлинг-стопы и жесткий лимит просадки по текущим ценам."""
-        for s in self.decider.check_stops(prices, self.book.units):
-            self._sell_all(s, prices[s], "trailing_stop")
+        for s in self.decider.check_stops(prices, self.book.units, prices):
+            self._close(s, prices[s], "trailing_stop")
             self.decider.on_stop_hit(s)
         equity = self.book.equity(prices)
         if self.decider.guard.check_intrabar(equity, datetime.now(timezone.utc)):
@@ -200,7 +227,7 @@ class Runner:
             self._notify(f"⚠️ <b>Лимит просадки</b>: счёт {messages.money(equity)} USDT, "
                          f"пик {messages.money(self.decider.guard.peak)}. Закрываю все позиции.")
             for s in self.symbols:
-                self._sell_all(s, prices[s], "drawdown_guard")
+                self._close(s, prices[s], "drawdown_guard")
             self.decider.reset_signals()
 
     def on_new_bar(self, prices: dict[str, float]) -> str | None:
@@ -237,9 +264,7 @@ class Runner:
 
         eq_now = self.book.equity(prices)
         for s in sorted(deltas, key=lambda s: deltas[s] - current.get(s, 0.0)):
-            diff_units = (deltas[s] - current.get(s, 0.0)) * eq_now / prices[s]
-            side = "buy" if diff_units > 0 else "sell"
-            self._execute(s, side, abs(diff_units), prices[s], "rebalance")
+            self._trade_to(s, deltas[s] * eq_now / prices[s], prices[s], "rebalance")
         self.last_bar = bar_ts
         self._dirty = True
         return bar_ts
@@ -250,17 +275,21 @@ class Runner:
         start = self.cfg.portfolio.initial_capital
         positions = []
         for s, u in self.book.units.items():
-            if u <= 0:
+            if not u:
                 continue
-            value, cost = u * prices[s], self.book.cost[s]
-            positions.append({"symbol": s, "units": u, "value": value,
-                              "weight": value / equity if equity else 0.0,
-                              "ret": value / cost - 1 if cost > 0 else 0.0,
+            side, entry = (1 if u > 0 else -1), self.book.entry[s]
+            value = abs(u) * prices[s]
+            positions.append({"symbol": s, "units": u, "side": side, "entry": entry,
+                              "value": value, "weight": value / equity if equity else 0.0,
+                              "ret": side * (prices[s] / entry - 1) if entry > 0 else 0.0,
                               "stop": self.decider.states[s].stop})
         guard = self.decider.guard
         return {
             "ts": datetime.now(timezone.utc).isoformat(),
             "mode": self.cfg.exchange.mode, "exchange": self.cfg.exchange.name,
+            "market": self.cfg.exchange.market,
+            "leverage": sum(abs(u) * prices[s] for s, u in self.book.units.items()) / equity
+            if equity else 0.0,
             "equity": equity, "cash": self.book.cash, "start_equity": start,
             "drawdown": guard.drawdown(equity), "peak": guard.peak,
             "paused": self.paused, "halted": guard.halted, "guard_paused_left": guard.paused_left,
@@ -270,6 +299,40 @@ class Runner:
             "total_ret": equity / start - 1,
             "positions": positions, "stats": dict(self.stats),
         }
+
+    def apply_funding(self, prices: dict[str, float]) -> None:
+        """Фандинг бессрочных фьючерсов: раз в 8 часов лонг платит ставку, шорт получает
+        (при отрицательной ставке — наоборот)."""
+        if not self.futures:
+            return
+        period = int(time.time() // (8 * 3600))
+        if self.last_funding < 0:
+            self.last_funding = period  # первый запуск: за прошлое не начисляем
+        if period <= self.last_funding:
+            return
+        periods, self.last_funding = period - self.last_funding, period
+        held = {s: u for s, u in self.book.units.items() if u}
+        if not held:
+            return
+        try:
+            rates = self.market.funding_rates(list(held))
+        except Exception as e:  # noqa: BLE001 — нет данных: лонги платят типовую ставку, шорты ноль
+            log.warning("Ставки фандинга недоступны (%s) — беру типовую", e)
+            rates = {}
+        total = 0.0
+        for s, u in held.items():
+            if s in rates:
+                pay = u * prices[s] * rates[s]
+            else:
+                pay = max(u, 0.0) * prices[s] * self.cfg.exchange.default_funding_8h
+            pay *= periods  # бот мог быть выключен несколько периодов
+            self.book.cash -= pay
+            self.pos_pnl[s] -= pay
+            total += pay
+        self.stats["realized"] -= total
+        self.stats["funding"] = self.stats.get("funding", 0.0) + total
+        self._dirty = True
+        log.info("Фандинг: %+.4f USDT (плюс — уплачено, минус — получено)", total)
 
     def _roll_marks(self, equity: float) -> None:
         """Смена суток (UTC): дневной отчёт и новые точки отсчёта для дня и месяца."""
@@ -299,7 +362,7 @@ class Runner:
             self.last_bar = None  # сразу пересчитать сигналы, не дожидаясь нового бара
         elif cmd == "close-all":
             for s in self.symbols:
-                self._sell_all(s, prices[s], "manual_close_all")
+                self._close(s, prices[s], "manual_close_all")
             self.decider.reset_signals()
             self.paused = True
         elif cmd == "stop":
@@ -311,6 +374,7 @@ class Runner:
         prices = self._prices = self.market.prices(self.symbols)
         self.apply_control(prices)
         self.check_risk(prices)
+        self.apply_funding(prices)
         if not self.paused:
             self.on_new_bar(prices)
         equity = self.book.equity(prices)
@@ -374,6 +438,9 @@ def build_runner(cfg: Config, confirm_live: bool = False) -> Runner:
         market = CcxtMarketData(name)
     if mode == "paper":
         broker = PaperBroker(cfg.exchange.fee, cfg.exchange.slippage)
+    elif cfg.exchange.market == "futures":
+        raise SystemExit("Фьючерсы пока работают только на виртуальном счёте (mode = \"paper\"). "
+                         "Реальные ордера на фьючерсах — следующий этап, после проверки на paper.")
     elif mode in ("testnet", "live"):
         if mode == "live" and not (confirm_live and os.getenv("BOT_LIVE_CONFIRM") == "yes"):
             raise SystemExit("Live-режим заблокирован. Нужны флаг --confirm-live и "

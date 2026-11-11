@@ -97,6 +97,7 @@ LABELS = {
     "avg_exposure": "Средняя загрузка капитала",
     "trades": "Сделок",
     "fees_paid": "Комиссии, USDT",
+    "funding_paid": "Фандинг уплачен (− получен), USDT",
 }
 
 

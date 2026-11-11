@@ -42,23 +42,39 @@ def pct(x: float, sign: bool = True) -> str:
     return f"{x * 100:+.2f}%" if sign else f"{x * 100:.2f}%"
 
 
+def _headline(side: str, before: float, after: float, futures: bool) -> str:
+    """Что именно сделал бот — словами, понятными без знания знаков позиции."""
+    if not futures:
+        if side == "buy":
+            return "🟢 <b>КУПИТЬ" if before <= 0 else "🟢 <b>ДОКУПИТЬ"
+        return "🔴 <b>ПРОДАТЬ" if after <= 0 else "🟠 <b>СОКРАТИТЬ"
+    if side == "buy":
+        if before < 0:
+            return "⚪️ <b>ЗАКРЫТЬ ШОРТ" if after == 0 else "🟠 <b>СОКРАТИТЬ ШОРТ"
+        return "🟢 <b>ОТКРЫТЬ ЛОНГ" if before == 0 else "🟢 <b>УВЕЛИЧИТЬ ЛОНГ"
+    if before > 0:
+        return "⚪️ <b>ЗАКРЫТЬ ЛОНГ" if after == 0 else "🟠 <b>СОКРАТИТЬ ЛОНГ"
+    return "🔴 <b>ОТКРЫТЬ ШОРТ" if before == 0 else "🔴 <b>УВЕЛИЧИТЬ ШОРТ"
+
+
 def trade_message(*, symbol: str, side: str, fill_price: float, notional: float, reason: str,
                   units_before: float, units_after: float, equity: float, weight_after: float,
                   stop: float = 0.0, position_pnl: float | None = None,
-                  position_ret: float | None = None, virtual: bool = True) -> str:
+                  position_ret: float | None = None, virtual: bool = True,
+                  futures: bool = False) -> str:
     """Сообщение-сигнал о сделке, которую бот только что совершил на своём счёте."""
-    if side == "buy":
-        head = "🟢 <b>КУПИТЬ" if units_before <= 0 else "🟢 <b>ДОКУПИТЬ"
-    else:
-        head = "🔴 <b>ПРОДАТЬ" if units_after <= 0 else "🟠 <b>СОКРАТИТЬ"
-    lines = [f"{head} {escape(symbol)}</b>",
+    opening = units_after != 0 and abs(units_after) > abs(units_before)
+    closed = units_after == 0 and units_before != 0
+    lines = [f"{_headline(side, units_before, units_after, futures)} {escape(symbol)}</b>",
              f"Цена: {price(fill_price)}",
              f"Сумма: {money(notional)} USDT"]
-    if side == "buy" or units_after > 0:
+    if units_after != 0:
         lines.append(f"Доля в счёте после сделки: {pct(weight_after, sign=False)}")
-    if side == "buy" and stop > 0:
+    if opening and stop > 0:
+        dist = abs(stop / fill_price - 1)
         lines.append(f"Стоп: {price(stop)} ({pct(stop / fill_price - 1)})")
-    if side == "sell" and units_after <= 0 and position_pnl is not None:
+        lines.append(f"Риск по позиции до стопа: {pct(weight_after * dist, sign=False)} счёта")
+    if closed and position_pnl is not None:
         icon = "✅" if position_pnl >= 0 else "❌"
         ret = f" ({pct(position_ret)})" if position_ret is not None else ""
         lines.append(f"{icon} Итог сделки: {signed(position_pnl)} USDT{ret}")
@@ -75,6 +91,8 @@ def _state_line(snap: dict) -> str:
     if snap.get("guard_paused_left"):
         return f"⏸ пауза защиты, осталось баров: {snap['guard_paused_left']}"
     if not snap.get("regime_ok", True):
+        if snap.get("market") == "futures":
+            return "🌧 рынок падает (BTC ниже средней) — бот ищет шорты"
         return "🌧 рынок слабый (фильтр по BTC) — бот вне рынка"
     return "▶️ торгует"
 
@@ -85,10 +103,17 @@ def _positions(snap: dict) -> list[str]:
         return ["Позиций нет — всё в USDT"]
     out = []
     for p in pos:
-        out.append(f"• <b>{escape(p['symbol'])}</b>: {money(p['value'])} USDT "
+        side = " ШОРТ" if p.get("side", 1) < 0 else (" ЛОНГ" if snap.get("market") == "futures" else "")
+        out.append(f"• <b>{escape(p['symbol'])}{side}</b>: {money(p['value'])} USDT "
                    f"({pct(p['weight'], sign=False)}), результат {pct(p['ret'])}, "
                    f"стоп {price(p['stop'])}")
     return out
+
+
+def _leverage(snap: dict) -> list[str]:
+    if snap.get("market") != "futures":
+        return []
+    return [f"Загрузка счёта (плечо): x{snap.get('leverage', 0.0):.2f}"]
 
 
 def status_text(snap: dict) -> str:
@@ -97,6 +122,7 @@ def status_text(snap: dict) -> str:
         _state_line(snap),
         f"Счёт: <b>{money(snap['equity'])} USDT</b> (кэш {money(snap['cash'])})",
         f"Просадка от пика: {pct(snap['drawdown'], sign=False)}",
+        *_leverage(snap),
         "",
         *_positions(snap),
         "",
@@ -116,10 +142,13 @@ def report_text(snap: dict, title: str = "Отчёт") -> str:
         f"За месяц: {pct(snap['month_ret'])}",
         f"С запуска: {pct(snap['total_ret'])} (старт {money(snap['start_equity'])} USDT)",
         f"Просадка от пика: {pct(snap['drawdown'], sign=False)}",
+        *_leverage(snap),
         "",
         *_positions(snap),
         "",
         f"Закрытых сделок: {closed}, прибыльных: {winrate}",
-        f"Зафиксировано: {signed(st.get('realized', 0.0))} USDT, "
-        f"комиссии: {money(st.get('fees', 0.0))} USDT",
+        f"Зафиксировано (чистыми): {signed(st.get('realized', 0.0))} USDT",
+        f"в т.ч. комиссии: {money(st.get('fees', 0.0))} USDT"
+        + (f", фандинг: {signed(-st.get('funding', 0.0) or 0.0)} USDT"
+           if snap.get("market") == "futures" else ""),
     ])

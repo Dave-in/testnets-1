@@ -26,6 +26,9 @@ monthly_target = 0.03       # для отчёта бэктеста: скольк
 "AVAX/USDT" = 0.25
 "LINK/USDT" = 0.25
 "ADA/USDT" = 0.25
+"XLM/USDT" = 0.25
+"DOT/USDT" = 0.25
+"UNI/USDT" = 0.25
 
 [strategy]
 entry_mode = "ema"

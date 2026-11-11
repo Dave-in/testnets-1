@@ -16,6 +16,8 @@ class ExchangeConfig:
     timeframe: str = "1d"
     fee: float = 0.001
     slippage: float = 0.0005
+    market: str = "spot"              # spot | futures (бессрочные USDT-M: шорты, плечо, фандинг)
+    default_funding_8h: float = 0.0001  # ставка фандинга, если биржа её не отдала (платят лонги)
 
 
 @dataclass
@@ -52,6 +54,11 @@ class StrategyConfig:
     min_trade: float = 0.01
     reentry_cooldown_bars: int = 5
     max_positions: int = 0  # 0 — без ограничения; N — держим только N сильнейших
+    # Шорты (только market = "futures"). С фильтром рынка шортим, лишь когда рынок падает.
+    allow_short: bool = False
+    short_scale: float = 1.0      # размер шорта относительно лонга (0.5 — вдвое меньше)
+    short_atr_stop_mult: float = 0.0  # стоп шорта в ATR; 0 — как у лонга
+    risk_per_trade: float = 0.0   # макс. потеря счёта при срабатывании стопа (0.01 = 1%); 0 — выкл
     # Фильтр режима рынка: торгуем, только когда regime_symbol выше своей EMA(regime_ema).
     regime_symbol: str = ""       # например "BTC/USDT"; пусто — фильтр выключен
     regime_ema: int = 200
@@ -60,6 +67,10 @@ class StrategyConfig:
     entry_mode: str = "ema"
     breakout_lookback: int = 20
     exit_lookback: int = 0        # > 0: выход при закрытии ниже минимума за N баров
+
+    @property
+    def short_atr_mult(self) -> float:
+        return self.short_atr_stop_mult or self.atr_stop_mult
 
     @property
     def warmup(self) -> int:

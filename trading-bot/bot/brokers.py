@@ -13,12 +13,14 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class Book:
+    """Счёт бота. units со знаком: > 0 лонг, < 0 шорт (шорты — только фьючерсы).
+    Капитал = cash + Σ units·цена — формула верна и для спота, и для бессрочных фьючерсов."""
     cash: float
     units: dict[str, float] = field(default_factory=dict)
-    cost: dict[str, float] = field(default_factory=dict)  # сколько USDT вложено в текущую позицию
+    entry: dict[str, float] = field(default_factory=dict)  # средняя цена входа в позицию
 
     def equity(self, prices: dict[str, float]) -> float:
-        return self.cash + sum(u * prices[s] for s, u in self.units.items() if u > 0)
+        return self.cash + sum(u * prices[s] for s, u in self.units.items() if u)
 
     def weights(self, prices: dict[str, float]) -> dict[str, float]:
         eq = self.equity(prices)

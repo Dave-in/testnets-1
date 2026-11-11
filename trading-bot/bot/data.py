@@ -146,3 +146,68 @@ def synthetic(symbols: list[str], bars: int = 2000, timeframe: str = "1d",
              "volume": rng.uniform(1e3, 1e4, bars)}, index=idx,
         ).rename_axis("ts")
     return out
+
+
+# --- фандинг бессрочных фьючерсов Binance (USDT-M) ---------------------------
+
+FUNDING_URL = ("https://data.binance.vision/data/futures/um/monthly/fundingRate/"
+               "{pair}/{pair}-fundingRate-{month}.zip")
+
+
+def funding_path(data_dir: str | Path, symbol: str) -> Path:
+    return Path(data_dir) / f"binance_funding_{symbol.replace('/', '-')}.csv"
+
+
+def _funding_month(pair: str, month: str) -> pd.DataFrame | None:
+    import io
+    import zipfile
+
+    import requests
+
+    for attempt in range(4):  # архив иногда рвёт соединение — повторяем
+        try:
+            r = requests.get(FUNDING_URL.format(pair=pair, month=month), timeout=30)
+            break
+        except requests.RequestException:
+            if attempt == 3:
+                raise
+            time.sleep(2 ** attempt)
+    if r.status_code != 200:
+        return None  # месяца нет: монета ещё не торговалась или месяц не закрыт
+    with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+        df = pd.read_csv(z.open(z.namelist()[0]))
+    # время выплаты у биржи бывает со сдвигом в миллисекунды — округляем до минуты
+    return pd.DataFrame({"ts": pd.to_datetime(df["calc_time"], unit="ms", utc=True).dt.floor("min"),
+                         "rate": df["last_funding_rate"].astype(float)})
+
+
+def download_funding(symbols: list[str], since: str, data_dir: str | Path) -> None:
+    """История ставок фандинга из публичного архива data.binance.vision (помесячно)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    months = [m.strftime("%Y-%m") for m in pd.period_range(since, pd.Timestamp.now(), freq="M")]
+    for sym in symbols:
+        pair = sym.replace("/", "")
+        with ThreadPoolExecutor(4) as pool:
+            parts = [p for p in pool.map(lambda m: _funding_month(pair, m), months) if p is not None]
+        if not parts:
+            print(f"{sym}: истории фандинга нет")
+            continue
+        df = pd.concat(parts).drop_duplicates("ts").sort_values("ts")
+        path = funding_path(data_dir, sym)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(path, index=False)
+        print(f"{sym}: фандинг {len(df)} выплат {df.ts.iloc[0]:%Y-%m-%d} … {df.ts.iloc[-1]:%Y-%m-%d}, "
+              f"в среднем {df.rate.mean() * 3 * 365 * 100:.1f}% годовых → {path}")
+
+
+def load_funding(data_dir: str | Path, symbols: list[str]) -> dict[str, pd.Series]:
+    out = {}
+    for sym in symbols:
+        path = funding_path(data_dir, sym)
+        if path.exists():
+            df = pd.read_csv(path)
+            out[sym] = pd.Series(df["rate"].to_numpy(),
+                                 index=pd.DatetimeIndex(pd.to_datetime(
+                                     df["ts"], utc=True, format="ISO8601")).floor("min")).sort_index()
+    return out

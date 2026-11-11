@@ -24,16 +24,24 @@ from .indicators import atr, ema, periods_per_year, realized_vol
 
 @dataclass
 class SymbolState:
-    in_position: bool = False
-    highest_close: float = 0.0
+    side: int = 0                # +1 лонг, −1 шорт, 0 вне рынка
+    extreme_close: float = 0.0   # максимум закрытия (лонг) / минимум закрытия (шорт) с момента входа
     stop: float = 0.0
     cooldown_left: int = 0
+
+    @property
+    def in_position(self) -> bool:
+        return self.side != 0
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "SymbolState":
+        d = dict(d)
+        if "in_position" in d:  # состояние, сохранённое версией без шортов
+            d["side"] = 1 if d.pop("in_position") else 0
+            d["extreme_close"] = d.pop("highest_close", 0.0)
         return cls(**d)
 
 
@@ -49,6 +57,9 @@ def prepare(df: pd.DataFrame, cfg: StrategyConfig, timeframe: str) -> pd.DataFra
     out["hh"] = out["high"].rolling(cfg.breakout_lookback).max().shift(1)
     if cfg.exit_lookback > 0:
         out["ll"] = out["low"].rolling(cfg.exit_lookback).min().shift(1)
+    out["ll_entry"] = out["low"].rolling(cfg.breakout_lookback).min().shift(1)
+    if cfg.exit_lookback > 0:
+        out["hh_exit"] = out["high"].rolling(cfg.exit_lookback).max().shift(1)
     out["regime_ok"] = True
     return out
 
@@ -71,77 +82,120 @@ def _ready(row: pd.Series) -> bool:
     )
 
 
-def update_signal(row: pd.Series, st: SymbolState, cfg: StrategyConfig) -> bool:
-    """Обновляет состояние актива по закрытию бара. Возвращает: хотим ли быть в лонге."""
+def update_signal(row: pd.Series, st: SymbolState, cfg: StrategyConfig) -> int:
+    """Обновляет состояние актива по закрытию бара.
+    Возвращает желаемую сторону: +1 лонг, −1 шорт, 0 вне рынка."""
     if not _ready(row):
-        st.in_position = False
-        return False
+        st.side = 0
+        return 0
 
-    close = float(row["close"])
-    if st.in_position:
-        st.highest_close = max(st.highest_close, close)
-        st.stop = max(st.stop, st.highest_close - cfg.atr_stop_mult * float(row["atr"]))
+    close, atr_now = float(row["close"]), float(row["atr"])
+    bull = bool(row["regime_ok"])          # рынок в целом растёт
+    has_regime = bool(cfg.regime_symbol)
+
+    if st.side > 0:
+        st.extreme_close = max(st.extreme_close, close)
+        st.stop = max(st.stop, st.extreme_close - cfg.atr_stop_mult * atr_now)
         trend_broken = close < row["ema_slow"] or row["ema_fast"] < row["ema_slow"]
-        regime_bad = cfg.regime_exit and not bool(row["regime_ok"])
+        regime_bad = cfg.regime_exit and not bull
         channel_exit = cfg.exit_lookback > 0 and close < row["ll"]
         if close <= st.stop or trend_broken or regime_bad or channel_exit:
             exit_position(st, cfg)
-        return st.in_position
+        return st.side
+
+    if st.side < 0:
+        st.extreme_close = min(st.extreme_close, close)
+        st.stop = min(st.stop, st.extreme_close + cfg.short_atr_mult * atr_now)
+        trend_broken = close > row["ema_slow"] or row["ema_fast"] > row["ema_slow"]
+        regime_bad = cfg.regime_exit and has_regime and bull
+        channel_exit = cfg.exit_lookback > 0 and close > row["hh_exit"]
+        if close >= st.stop or trend_broken or regime_bad or channel_exit:
+            exit_position(st, cfg)
+        return st.side
 
     if st.cooldown_left > 0:
         st.cooldown_left -= 1
-        return False
+        return 0
 
-    if not bool(row["regime_ok"]):
-        return False
-    if cfg.entry_mode == "breakout":
-        entry = close > row["hh"] and close > row["ema_slow"] and row["mom"] > 0
-    else:
-        entry = close > row["ema_fast"] > row["ema_slow"] and row["mom"] > 0
-    if entry:
-        st.in_position = True
-        st.highest_close = close
-        st.stop = close - cfg.atr_stop_mult * float(row["atr"])
-    return st.in_position
+    breakout = cfg.entry_mode == "breakout"
+    if bull:
+        if breakout:
+            entry = close > row["hh"] and close > row["ema_slow"] and row["mom"] > 0
+        else:
+            entry = close > row["ema_fast"] > row["ema_slow"] and row["mom"] > 0
+        if entry:
+            st.side, st.extreme_close = 1, close
+            st.stop = close - cfg.atr_stop_mult * atr_now
+    if st.side == 0 and cfg.allow_short and (not has_regime or not bull):
+        # шорт — только когда рынок в целом падает (если фильтр рынка включён)
+        if breakout:
+            entry = close < row["ll_entry"] and close < row["ema_slow"] and row["mom"] < 0
+        else:
+            entry = close < row["ema_fast"] < row["ema_slow"] and row["mom"] < 0
+        if entry:
+            st.side, st.extreme_close = -1, close
+            st.stop = close + cfg.short_atr_mult * atr_now
+    return st.side
 
 
 def exit_position(st: SymbolState, cfg: StrategyConfig) -> None:
-    st.in_position = False
-    st.highest_close = 0.0
+    st.side = 0
+    st.extreme_close = 0.0
     st.stop = 0.0
     st.cooldown_left = cfg.reentry_cooldown_bars
 
 
 def size_weights(
+    sides: dict[str, int],
     vols: dict[str, float],
+    stop_dist: dict[str, float],
     returns: pd.DataFrame,
     caps: dict[str, float],
     cfg: StrategyConfig,
     timeframe: str,
     max_gross: float,
 ) -> dict[str, float]:
-    """Веса для активов, по которым есть сигнал на лонг.
+    """Веса со знаком (+ лонг, − шорт) для активов с сигналом.
 
-    vols    — годовая волатильность каждого актива с сигналом
-    returns — лог-доходности за последние vol_lookback баров (для корреляций)
+    sides     — сторона по каждому активу (+1 / −1)
+    vols      — годовая волатильность
+    stop_dist — расстояние до стопа в долях цены (для лимита риска на сделку)
+    returns   — лог-доходности за последние vol_lookback баров (для корреляций)
+
+    Три ограничителя размера, работает самый строгий:
+      1) волатильность: чем сильнее скачет актив, тем меньше позиция;
+      2) риск на сделку: срабатывание стопа стоит не больше risk_per_trade счёта;
+      3) потолок доли актива (caps) и общее плечо (max_gross).
     """
-    if not vols:
+    w: dict[str, float] = {}
+    for s, side in sides.items():
+        v = vols.get(s, 0.0)
+        if not side or not v or v <= 0:
+            continue
+        size = min(caps[s], cfg.target_vol / v)
+        d = stop_dist.get(s, 0.0)
+        if cfg.risk_per_trade > 0 and d > 0:
+            size = min(size, cfg.risk_per_trade / d)
+        if side < 0:
+            size *= cfg.short_scale
+        if size > 0:
+            w[s] = side * size
+    if not w:
         return {}
-    w = {s: min(caps[s], cfg.target_vol / v) if v > 0 else 0.0 for s, v in vols.items()}
 
-    # Учитываем корреляцию: если активы ходят вместе, суммарный риск выше.
-    syms = [s for s in w if w[s] > 0]
+    # Корреляция: лонги усиливают друг друга, лонг и шорт частично гасят.
+    syms = list(w)
     if len(syms) > 1:
         sub = returns[syms].dropna()
         if len(sub) >= 5:
             cov = sub.cov().to_numpy() * periods_per_year(timeframe)
             vec = np.array([w[s] for s in syms])
-            port_vol = float(np.sqrt(vec @ cov @ vec))
+            port_vol = float(np.sqrt(max(vec @ cov @ vec, 0.0)))
             if port_vol > cfg.target_vol:
                 k = cfg.target_vol / port_vol
                 w = {s: x * k for s, x in w.items()}
 
-    gross = sum(w.values())
+    gross = sum(abs(x) for x in w.values())
     if gross > max_gross:
         w = {s: x * max_gross / gross for s, x in w.items()}
     return w

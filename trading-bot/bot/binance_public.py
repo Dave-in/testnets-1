@@ -13,6 +13,7 @@ import requests
 from .data import _to_frame
 
 HOSTS = ["https://api.binance.com", "https://data-api.binance.vision"]
+FUTURES_HOST = "https://fapi.binance.com"
 TIMEFRAME_MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000, "2h": 7_200_000,
                 "4h": 14_400_000, "6h": 21_600_000, "12h": 43_200_000, "1d": 86_400_000}
 
@@ -77,6 +78,15 @@ class BinancePublic:
         if len(df) and df.index[-1] + step > pd.Timestamp.now(tz="UTC"):
             df = df.iloc[:-1]
         return df
+
+    def funding_rates(self, symbols: list[str]) -> dict[str, float]:
+        """Последняя ставка фандинга USDT-M фьючерсов (за один период выплаты)."""
+        r = self.session.get(FUTURES_HOST + "/fapi/v1/premiumIndex", timeout=self.timeout)
+        if r.status_code != 200:
+            raise RuntimeError(f"fapi: HTTP {r.status_code}")
+        want = {self._pair(s): s for s in symbols}
+        return {want[d["symbol"]]: float(d["lastFundingRate"])
+                for d in r.json() if d["symbol"] in want and d.get("lastFundingRate") not in ("", None)}
 
     def prices(self, symbols: list[str]) -> dict[str, float]:
         want = {self._pair(s): s for s in symbols}

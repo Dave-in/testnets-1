@@ -1,0 +1,70 @@
+# Активный бот на бессрочных фьючерсах Binance (USDT-M): лонги и шорты, сигналы в Telegram,
+# виртуальный счёт на реальных ценах.   Запуск: python -m bot --config config.futures.toml run
+# Параметры и результаты на истории 2020–2026 — в README.md и PROJECT_NOTES.md.
+
+[exchange]
+name = "binance"
+mode = "paper"              # виртуальный счёт; фьючерсы пока только в этом режиме
+market = "futures"          # шорты, фандинг, плечо
+timeframe = "1d"            # решения раз в сутки (00:00 UTC), стопы проверяются каждую минуту
+fee = 0.0005                # комиссия фьючерсов Binance 0.05% (taker)
+slippage = 0.0005
+default_funding_8h = 0.0001 # ставка фандинга, если биржа не отдала текущую
+
+[portfolio]
+profile = "futures"
+initial_capital = 10000.0   # размер виртуального счёта, USDT
+max_gross_exposure = 1.0    # сумма всех позиций (лонги + шорты) не больше счёта: плечо счёта ≤ x1
+monthly_target = 0.02
+
+# Монеты и максимальная доля каждой. Бот держит до max_positions самых сильных движений.
+[portfolio.profiles.futures]
+"BTC/USDT" = 0.40
+"ETH/USDT" = 0.40
+"SOL/USDT" = 0.30
+"BNB/USDT" = 0.30
+"XRP/USDT" = 0.30
+"DOGE/USDT" = 0.25
+"AVAX/USDT" = 0.25
+"LINK/USDT" = 0.25
+"ADA/USDT" = 0.25
+"XLM/USDT" = 0.25
+"DOT/USDT" = 0.25
+"UNI/USDT" = 0.25
+
+[strategy]
+entry_mode = "ema"
+fast_ema = 20               # лонг: цена > EMA20 > EMA100 и рост за 30 дней; шорт — зеркально
+slow_ema = 100
+momentum_lookback = 30
+atr_period = 14
+atr_stop_mult = 3.5         # трейлинг-стоп лонга: максимум закрытия − 3.5·ATR
+short_atr_stop_mult = 0.0   # стоп шорта: минимум закрытия + N·ATR (0 — как у лонга)
+vol_lookback = 20
+target_vol = 0.25
+rebalance_threshold = 0.4
+min_trade = 0.02
+reentry_cooldown_bars = 3
+max_positions = 4
+allow_short = true          # шорты разрешены
+short_scale = 1.0           # размер шорта относительно лонга
+risk_per_trade = 0.01       # срабатывание стопа стоит не больше 1% счёта
+regime_symbol = "BTC/USDT"  # BTC выше EMA200 → только лонги; ниже → только шорты
+regime_ema = 200
+regime_exit = true
+
+[risk]
+hard_stop_action = "scale"  # чем глубже просадка от пика, тем меньше позиции
+soft_drawdown = 0.05
+hard_drawdown = 0.15
+soft_scale = 0.4
+cooldown_bars = 5
+resume_drawdown = 0.10
+
+[live]
+poll_seconds = 60
+state_dir = "state"
+
+[telegram]
+enabled = true
+daily_report = true
