@@ -152,3 +152,14 @@ def report_text(snap: dict, title: str = "Отчёт") -> str:
         + (f", фандинг: {signed(-st.get('funding', 0.0) or 0.0)} USDT"
            if snap.get("market") == "futures" else ""),
     ])
+
+
+def group_report(items: list[tuple[str, dict]], title: str = "Отчёт") -> str:
+    """Общий отчёт по нескольким виртуальным счетам: сначала сравнение, затем подробности."""
+    date = items[0][1]["ts"][:10]
+    head = [f"<b>{escape(title)}</b> · {date}", "", "<b>Сравнение счетов</b> (с запуска · за день · просадка)"]
+    for name, s in items:
+        head.append(f"• {escape(name)}: {money(s['equity'])} USDT · {pct(s['total_ret'])} · "
+                    f"{pct(s['day_ret'])} · {pct(s['drawdown'], sign=False)}")
+    blocks = [report_text(s, name) for name, s in items]
+    return "\n".join(head) + "\n\n" + "\n\n".join(blocks)

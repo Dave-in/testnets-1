@@ -5,6 +5,7 @@
   python -m bot backtest  --synthetic                      # проверка механики без интернета
   python -m bot walkforward --start 2020-01-01 --window 365 # по годам/окнам
   python -m bot run                                        # paper/testnet/live (по config)
+  python -m bot run-all                                    # несколько счетов сразу (bots.toml)
   python -m bot ctl status | pause | resume | close-all | stop
   python -m bot logs -n 50
 """
@@ -135,6 +136,20 @@ def cmd_run(args) -> None:
     logging.info("Старт: режим=%s биржа=%s профиль=%s", cfg.exchange.mode, cfg.exchange.name,
                  cfg.portfolio.profile)
     build_runner(cfg, confirm_live=args.confirm_live).run(once=args.once)
+
+
+def cmd_run_all(args) -> None:
+    """Несколько виртуальных счетов в одном процессе (список — в bots.toml)."""
+    from .group import build_group
+
+    Path("logs").mkdir(exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[logging.StreamHandler(), logging.FileHandler("logs/bot.log", encoding="utf-8")],
+    )
+    logging.info("Старт группы счетов из %s", args.group)
+    build_group(args.group, confirm_live=args.confirm_live).run(once=args.once)
 
 
 def cmd_ctl(args) -> None:
@@ -274,6 +289,12 @@ def main(argv=None) -> None:
     r.add_argument("--once", action="store_true", help="один шаг и выход")
     r.add_argument("--confirm-live", action="store_true")
     r.set_defaults(func=cmd_run)
+
+    ra = sub.add_parser("run-all", help="несколько виртуальных счетов сразу (bots.toml)")
+    ra.add_argument("--group", default="bots.toml")
+    ra.add_argument("--once", action="store_true", help="один шаг и выход")
+    ra.add_argument("--confirm-live", action="store_true")
+    ra.set_defaults(func=cmd_run_all)
 
     c = sub.add_parser("ctl", help="управление: status | pause | resume | close-all | stop")
     c.add_argument("action", choices=["status", "pause", "resume", "close-all", "stop"])

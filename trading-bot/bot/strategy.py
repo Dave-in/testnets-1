@@ -60,6 +60,9 @@ def prepare(df: pd.DataFrame, cfg: StrategyConfig, timeframe: str) -> pd.DataFra
     out["ll_entry"] = out["low"].rolling(cfg.breakout_lookback).min().shift(1)
     if cfg.exit_lookback > 0:
         out["hh_exit"] = out["high"].rolling(cfg.exit_lookback).max().shift(1)
+    n = cfg.momentum_lookback
+    path = out["close"].diff().abs().rolling(n).sum()
+    out["quality"] = (out["close"] - out["close"].shift(n)).abs() / path
     out["regime_ok"] = True
     return out
 
@@ -118,6 +121,8 @@ def update_signal(row: pd.Series, st: SymbolState, cfg: StrategyConfig) -> int:
         return 0
 
     breakout = cfg.entry_mode == "breakout"
+    if cfg.min_trend_quality > 0 and not (row["quality"] >= cfg.min_trend_quality):
+        return 0  # движение слишком «пилообразное» (или данных мало) — не входим
     if bull:
         if breakout:
             entry = close > row["hh"] and close > row["ema_slow"] and row["mom"] > 0

@@ -520,3 +520,118 @@ def test_state_from_version_without_shorts_still_loads(tmp_path):
     r = Runner(cfg, FakeMarket({"ETH/USDT": trend_frame()}), PaperBroker(0.001, 0.0005), path)
     assert r.book.entry["ETH/USDT"] == pytest.approx(3000.0)
     assert r.decider.states["ETH/USDT"].side == 1
+
+
+# --- фильтр чистоты тренда и группа счетов ------------------------------------
+
+def test_trend_quality_filter_blocks_choppy_entries():
+    """Ровный рост проходит фильтр, «пила» с тем же итоговым ростом — нет."""
+    n = 400
+    idx = pd.date_range("2020-01-01", periods=n, freq="1D", tz="UTC")
+
+    def frame(rets):
+        close = 100 * np.exp(np.cumsum(rets))
+        open_ = np.r_[close[0], close[:-1]]
+        return pd.DataFrame({"open": open_, "high": np.maximum(open_, close) * 1.002,
+                             "low": np.minimum(open_, close) * 0.998, "close": close,
+                             "volume": 1.0}, index=idx)
+
+    smooth = frame(np.full(n, 0.004))
+    saw = frame(0.004 + 0.05 * np.where(np.arange(n) % 2 == 0, 1.0, -1.0))  # тот же дрейф, но пила
+    cfg = make_cfg()
+    cfg.strategy.min_trend_quality = 0.3
+    assert len(Backtester(cfg, {"ETH/USDT": smooth}).run().trades) > 0
+    assert len(Backtester(cfg, {"ETH/USDT": saw}).run().trades) == 0
+    cfg.strategy.min_trend_quality = 0.0                 # без фильтра в пилу бот входит
+    assert len(Backtester(cfg, {"ETH/USDT": saw}).run().trades) > 0
+
+
+def test_split_message_keeps_everything():
+    from bot.telegram import split_message
+
+    text = "\n\n".join(f"блок {i} " + "x" * 500 for i in range(20))
+    parts = split_message(text, limit=1500)
+    assert len(parts) > 1 and all(len(p) <= 1500 for p in parts)
+    assert "\n\n".join(parts) == text
+    assert split_message("коротко") == ["коротко"]
+
+
+def test_group_runs_accounts_side_by_side(tmp_path):
+    from bot.group import Group, Labeled
+    from bot.live import control_path
+    from bot.telegram import CommandListener, Telegram
+
+    sent, queue = [], []
+
+    def post(method, payload, timeout):
+        if method == "getUpdates":
+            items, queue[:] = list(queue), []
+            return {"ok": True, "result": items}
+        sent.append(payload["text"])
+        return {"ok": True}
+
+    tg = Telegram("T", 111, post)
+    runners = {}
+    for name, fut, signals in (("Спот", False, True), ("Фьючерсы", True, True), ("База", False, False)):
+        cfg = futures_cfg() if fut else make_cfg()
+        cfg.telegram.daily_report = False
+        market = FakeMarket({"ETH/USDT": mirror(trend_frame()) if fut else trend_frame()})
+        runners[name] = Runner(cfg, market, PaperBroker(0.001, 0.0005), tmp_path / f"{name}.json",
+                               Labeled(tg, name) if signals else None)
+    group = Group(runners, tg, poll_seconds=1)
+    for _ in range(80):
+        group.step_all()
+        for r in runners.values():
+            r.market.i += 1
+    assert any(t.startswith("<b>[Спот]</b>") and "КУПИТЬ" in t for t in sent)
+    assert any(t.startswith("<b>[Фьючерсы]</b>") and "ОТКРЫТЬ ШОРТ" in t for t in sent)
+    assert not any("[База]" in t for t in sent)          # без сигналов
+    assert runners["База"].book.units["ETH/USDT"] > 0    # но торгует
+
+    # общий отчёт за день — один на все счета, когда у всех сменились сутки
+    sent.clear()
+    for r in runners.values():
+        r.marks["day"] = "2000-01-01"
+    group.step_all()
+    group.maybe_report()
+    reports = [t for t in sent if "Отчёт за день" in t]
+    assert len(reports) == 1 and all(n in reports[0] for n in ("Спот", "Фьючерсы", "База"))
+    assert "Сравнение счетов" in reports[0]
+    group.maybe_report()
+    assert len([t for t in sent if "Отчёт за день" in t]) == 1
+
+    # команды: статус по всем счетам, пауза — всем
+    bots = [(n, r.state_path, control_path(r.state_path)) for n, r in runners.items()]
+    listener = CommandListener(Telegram("T", 111, post), bots=bots)
+    sent.clear()
+    queue.append({"update_id": 1, "message": {"chat": {"id": 111}, "text": "/status"}})
+    queue.append({"update_id": 2, "message": {"chat": {"id": 111}, "text": "/pause"}})
+    listener.poll_once()
+    assert all(f"[{n}]" in sent[0] for n in runners)
+    group.step_all()
+    assert all(r.paused for r in runners.values())
+
+    # сбой одного счёта не останавливает остальные
+    def boom(symbols):
+        raise RuntimeError("биржа недоступна")
+    runners["Спот"].market.prices = boom
+    before = runners["Фьючерсы"].snapshot["ts"]
+    group.step_all()
+    assert group.errors["Спот"] == 1 and group.errors["Фьючерсы"] == 0
+    assert runners["Фьючерсы"].snapshot["ts"] >= before
+
+
+def test_bots_toml_and_configs_load():
+    from pathlib import Path
+
+    from bot.config import load_config
+    from bot.group import load_group
+    from bot.live import state_path_for
+
+    root = Path(__file__).resolve().parents[1]
+    specs = load_group(root / "bots.toml")
+    cfgs = [load_config(root / s.config) for s in specs]
+    assert len({str(state_path_for(c)) for c in cfgs}) == len(cfgs)   # у каждого свой счёт
+    assert all(c.exchange.mode == "paper" for c in cfgs)              # только виртуальные деньги
+    trend = load_config(root / "config.trend.toml")
+    assert trend.strategy.min_trend_quality == 0.3 and trend.strategy.fast_ema == 10

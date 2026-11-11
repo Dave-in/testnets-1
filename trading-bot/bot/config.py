@@ -63,6 +63,10 @@ class StrategyConfig:
     regime_symbol: str = ""       # например "BTC/USDT"; пусто — фильтр выключен
     regime_ema: int = 200
     regime_exit: bool = True      # True — при плохом режиме выходим из всех позиций
+    # Фильтр чистоты тренда: входим, только если за momentum_lookback баров цена шла ровно.
+    # Мера (efficiency ratio) = |цена сейчас − цена N баров назад| / сумма модулей изменений
+    # за N баров: около 1 — ровное движение, около 0 — «пила». 0 — фильтр выключен.
+    min_trend_quality: float = 0.0
     # Вход: "ema" — тренд по средним; "breakout" — пробой максимума за breakout_lookback баров
     entry_mode: str = "ema"
     breakout_lookback: int = 20

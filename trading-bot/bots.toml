@@ -1,0 +1,20 @@
+# Какие виртуальные счета запускать вместе (python -m bot run-all).
+# Все работают в одном процессе и пишут в один чат Telegram; у каждого свой счёт в state/.
+#   name    — подпись в сообщениях
+#   config  — файл стратегии
+#   signals — присылать ли сигналы о сделках (false: счёт виден только в /status и отчётах)
+
+[[bot]]
+name = "Спот-быстрый"          # основной: быстрые средние + фильтр чистоты тренда
+config = "config.trend.toml"
+signals = true
+
+[[bot]]
+name = "Фьючерсы"              # лонги и шорты, риск 1% на сделку
+config = "config.futures.toml"
+signals = true
+
+[[bot]]
+name = "Спот-база"             # прежняя стратегия — для сравнения, без сигналов
+config = "config.signals.toml"
+signals = false

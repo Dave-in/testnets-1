@@ -73,6 +73,7 @@ class Runner:
         self.marks: dict = {}        # капитал на начало дня/месяца — для отчётов
         self.regime_ok = True
         self.snapshot: dict = {}
+        self.day_snapshot: dict | None = None  # итог закончившихся суток (для общего отчёта)
         self._dirty = True           # были сделки/новый бар → записать точку в журнал капитала
         self._last_journal_hour = ""
         self.last_bar: str | None = None
@@ -247,9 +248,15 @@ class Runner:
         rows = {s: df.iloc[-1] for s, df in frames.items() if len(df)}
         was_ok, self.regime_ok = self.regime_ok, all(bool(r["regime_ok"]) for r in rows.values())
         if was_ok != self.regime_ok:
-            self._notify("🌤 Рынок снова растёт (BTC выше своей средней) — бот возвращается к сделкам."
-                         if self.regime_ok else
-                         "🌧 Рынок ослаб (BTC ниже своей средней) — бот выходит в USDT и ждёт.")
+            if self.cfg.strategy.allow_short:
+                self._notify("🌤 Рынок снова растёт (BTC выше своей средней) — бот закрывает шорты "
+                             "и ищет лонги." if self.regime_ok else
+                             "🌧 Рынок падает (BTC ниже своей средней) — бот закрывает лонги "
+                             "и ищет шорты.")
+            else:
+                self._notify("🌤 Рынок снова растёт (BTC выше своей средней) — бот возвращается "
+                             "к сделкам." if self.regime_ok else
+                             "🌧 Рынок ослаб (BTC ниже своей средней) — бот выходит в USDT и ждёт.")
         n = self.cfg.strategy.vol_lookback
         rets = pd.DataFrame({s: np.log(df["close"]).diff().iloc[-n:] for s, df in frames.items()})
         close_prices = {s: float(rows[s]["close"]) for s in rows}
@@ -339,8 +346,10 @@ class Runner:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if self.marks.get("day") == today:
             return
-        if self.marks.get("day") and self.cfg.telegram.daily_report:
-            self._notify(messages.report_text(self.snapshot, "Отчёт за день"))
+        if self.marks.get("day"):
+            self.day_snapshot = self.snapshot
+            if self.cfg.telegram.daily_report:
+                self._notify(messages.report_text(self.snapshot, "Отчёт за день"))
         self.marks.update(day=today, day_equity=equity)
         if self.marks.get("month") != today[:7]:
             self.marks.update(month=today[:7], month_equity=equity)
@@ -427,15 +436,18 @@ def state_path_for(cfg: Config) -> Path:
             / f"{cfg.exchange.mode}_{cfg.exchange.name}_{cfg.portfolio.profile}.json")
 
 
-def build_runner(cfg: Config, confirm_live: bool = False) -> Runner:
+def build_parts(cfg: Config, confirm_live: bool = False, market=None):
+    """Источник цен и исполнитель сделок для конфига. market можно передать готовый,
+    чтобы несколько счетов ходили на биржу через одно соединение."""
     mode = cfg.exchange.mode
     name = cfg.exchange.name
     # сигналы всегда по ценам основной биржи
-    if name == "binance":
-        from .binance_public import BinancePublic
-        market = BinancePublic()
-    else:
-        market = CcxtMarketData(name)
+    if market is None:
+        if name == "binance":
+            from .binance_public import BinancePublic
+            market = BinancePublic()
+        else:
+            market = CcxtMarketData(name)
     if mode == "paper":
         broker = PaperBroker(cfg.exchange.fee, cfg.exchange.slippage)
     elif cfg.exchange.market == "futures":
@@ -453,6 +465,12 @@ def build_runner(cfg: Config, confirm_live: bool = False) -> Runner:
                                 cfg.exchange.fee)
     else:
         raise SystemExit(f"Неизвестный режим: {mode}")
+    return market, broker
+
+
+def build_runner(cfg: Config, confirm_live: bool = False) -> Runner:
+    mode, name = cfg.exchange.mode, cfg.exchange.name
+    market, broker = build_parts(cfg, confirm_live)
     state = state_path_for(cfg)
     notifier = None
     if cfg.telegram.enabled:

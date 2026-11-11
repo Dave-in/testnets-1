@@ -23,6 +23,18 @@ log = logging.getLogger(__name__)
 API = "https://api.telegram.org"
 
 
+def split_message(text: str, limit: int = 3800) -> list[str]:
+    """Telegram принимает до 4096 символов: длинный текст режем по пустым строкам."""
+    parts, cur = [], ""
+    for block in text.split("\n\n"):
+        if cur and len(cur) + len(block) + 2 > limit:
+            parts.append(cur)
+            cur = block
+        else:
+            cur = f"{cur}\n\n{block}" if cur else block
+    return parts + [cur] if cur else parts
+
+
 class Telegram:
     def __init__(self, token: str, chat_id: str | int | None = None, post: Callable | None = None):
         self.token = token
@@ -42,15 +54,19 @@ class Telegram:
         target = chat_id or self.chat_id
         if not target:
             return False
-        try:
-            res = self.call("sendMessage", {"chat_id": target, "text": text, "parse_mode": "HTML",
-                                            "disable_web_page_preview": True})
-            if not res.get("ok"):
-                log.error("Telegram отклонил сообщение: %s", res.get("description"))
-            return bool(res.get("ok"))
-        except Exception as e:  # noqa: BLE001
-            log.error("Telegram недоступен: %s", e)
-            return False
+        ok = True
+        for part in split_message(text):
+            try:
+                res = self.call("sendMessage", {"chat_id": target, "text": part,
+                                                "parse_mode": "HTML",
+                                                "disable_web_page_preview": True})
+                if not res.get("ok"):
+                    log.error("Telegram отклонил сообщение: %s", res.get("description"))
+                ok = ok and bool(res.get("ok"))
+            except Exception as e:  # noqa: BLE001
+                log.error("Telegram недоступен: %s", e)
+                ok = False
+        return ok
 
     def updates(self, timeout: int = 25) -> list[dict]:
         res = self.call("getUpdates", {"offset": self.offset, "timeout": timeout,
@@ -70,40 +86,54 @@ class CommandListener(threading.Thread):
     Состояние берёт из JSON-файла бота, а команды управления кладёт в control-файл —
     то есть с торговым циклом общается только через файлы, без общей памяти."""
 
-    def __init__(self, tg: Telegram, state_path: Path, control_path: Path):
+    def __init__(self, tg: Telegram, state_path: Path | None = None,
+                 control_path: Path | None = None, bots: list[tuple] | None = None):
+        """bots — список (имя, файл состояния, control-файл); для одного счёта
+        достаточно state_path и control_path."""
         super().__init__(daemon=True, name="telegram-commands")
         self.tg = tg
-        self.state_path = Path(state_path)
-        self.control_path = Path(control_path)
+        self.bots = [(n, Path(s), Path(c)) for n, s, c in (bots or [("", state_path, control_path)])]
         self.stop_event = threading.Event()
 
-    def _snapshot(self) -> dict | None:
-        try:
-            return json.loads(self.state_path.read_text()).get("snapshot")
-        except (OSError, ValueError):
-            return None
+    def _snapshots(self) -> list[tuple[str, dict]]:
+        out = []
+        for name, state, _ in self.bots:
+            try:
+                snap = json.loads(state.read_text()).get("snapshot")
+            except (OSError, ValueError):
+                snap = None
+            if snap:
+                out.append((name, snap))
+        return out
 
     def _control(self, command: str) -> None:
-        self.control_path.write_text(json.dumps({"command": command}))
+        for _, _, control in self.bots:
+            control.write_text(json.dumps({"command": command}))
 
     def handle(self, text: str) -> str:
         cmd = text.strip().split()[0].split("@")[0].lower() if text.strip() else ""
+        many = len(self.bots) > 1
         if cmd in ("/start", "/help"):
             return messages.HELP
         if cmd in ("/status", "/report"):
-            snap = self._snapshot()
-            if not snap:
+            snaps = self._snapshots()
+            if not snaps:
                 return "Бот ещё не сохранил состояние. Попробуйте через минуту."
-            return messages.status_text(snap) if cmd == "/status" else messages.report_text(snap)
+            if cmd == "/report":
+                return messages.group_report(snaps) if many else messages.report_text(snaps[0][1])
+            return "\n\n".join(
+                (f"<b>[{messages.escape(n)}]</b>\n" if many else "") + messages.status_text(s)
+                for n, s in snaps)
+        scope = " на всех счетах" if many else ""
         if cmd == "/pause":
             self._control("pause")
-            return "⏸ Пауза: новых сделок не будет, стопы и защита работают."
+            return f"⏸ Пауза{scope}: новых сделок не будет, стопы и защита работают."
         if cmd == "/resume":
             self._control("resume")
-            return "▶️ Пауза снята."
+            return f"▶️ Пауза снята{scope}."
         if cmd == "/closeall":
             self._control("close-all")
-            return "🔴 Продаю всё в USDT и встаю на паузу. Вернуть в работу: /resume"
+            return f"🔴 Закрываю все позиции{scope} и встаю на паузу. Вернуть в работу: /resume"
         return "Не знаю такой команды. /help — список."
 
     def poll_once(self) -> None:
