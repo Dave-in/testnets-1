@@ -182,6 +182,10 @@ class Runner:
             position_ret = position_pnl / invested if invested > 0 else None
             self.stats["closed"] += 1
             self.stats["wins"] += position_pnl > 0
+            if self.cfg.challenge.enabled:   # для разбора попытки
+                self.attempt.setdefault("closed", []).append(
+                    {"symbol": symbol, "side": 1 if before > 0 else -1,
+                     "pnl": round(position_pnl, 4)})
             after = self.book.entry[symbol] = 0.0
             self.pos_pnl[symbol] = self.pos_invested[symbol] = 0.0
         self.book.units[symbol] = after
@@ -303,9 +307,10 @@ class Runner:
             ch, done = self.cfg.challenge, self.attempts
             extra["challenge"] = {
                 "n": self.attempt["n"], "started": self.attempt["started"],
-                "mult": equity / start, "target": ch.target_mult, "bust": ch.bust_fraction,
+                "mult": equity / start, "target": self.target_mult, "bust": ch.bust_fraction,
                 "won": sum(a["outcome"] == "win" for a in done),
                 "lost": sum(a["outcome"] == "bust" for a in done),
+                "cashed": sum(a["outcome"] == "cashout" for a in done),
                 "spent": start * (len(done) + 1), "returned": sum(a["final"] for a in done)}
         if self.decider.learn["lessons"]:
             extra["lessons"] = self.decider.learn["lessons"][-3:]
@@ -362,19 +367,26 @@ class Runner:
         self._dirty = True
         log.info("Фандинг: %+.4f USDT (плюс — уплачено, минус — получено)", total)
 
+    @property
+    def target_mult(self) -> float:
+        """Цель текущей попытки: из конфига или заданная командой /target."""
+        return float(self.attempt.get("target") or self.cfg.challenge.target_mult)
+
     def check_challenge(self, prices: dict[str, float]) -> None:
         """Режим попыток: цель достигнута или счёт слит → фиксируем итог и начинаем заново."""
         ch = self.cfg.challenge
         if not ch.enabled:
             return
-        start = self.cfg.portfolio.initial_capital
-        mult = self.book.equity(prices) / start
-        if mult >= ch.target_mult:
-            outcome = "win"
+        mult = self.book.equity(prices) / self.cfg.portfolio.initial_capital
+        if mult >= self.target_mult:
+            self._finish_attempt("win", prices)
         elif mult <= ch.bust_fraction:
-            outcome = "bust"
-        else:
-            return
+            self._finish_attempt("bust", prices)
+
+    def _finish_attempt(self, outcome: str, prices: dict[str, float]) -> None:
+        """Закрыть позиции, записать итог попытки и начать следующую.
+        outcome: win — цель, bust — слив, cashout — вывод по команде владельца."""
+        start = self.cfg.portfolio.initial_capital
         for s in self.symbols:
             self._close(s, prices[s], f"challenge_{outcome}")
         final = self.book.equity(prices)
@@ -382,11 +394,13 @@ class Runner:
         days = (now - datetime.fromisoformat(self.attempt["started"])).total_seconds() / 86400
         self.attempts.append({"n": self.attempt["n"], "started": self.attempt["started"],
                               "ended": now.isoformat(), "outcome": outcome,
-                              "final": final, "mult": final / start, "days": days})
+                              "final": final, "mult": final / start, "days": days,
+                              "closed": self.attempt.get("closed", [])})
         log.warning("Попытка №%s: %s, итог %.2f USDT (x%.2f) за %.1f дн.",
                     self.attempt["n"], outcome, final, final / start, days)
         self._notify(messages.challenge_result(self.attempts[-1], start, self.attempts))
-        # новая попытка: тот же стартовый счёт, чистые позиции; уроки (decider.learn) сохраняются
+        # новая попытка: тот же стартовый счёт и цель, чистые позиции;
+        # уроки (decider.learn) сохраняются и действуют дальше
         self.book = Book(cash=start, units={s: 0.0 for s in self.symbols},
                          entry={s: 0.0 for s in self.symbols})
         self.pos_pnl = {s: 0.0 for s in self.symbols}
@@ -394,7 +408,10 @@ class Runner:
         self.decider.reset_signals()
         self.decider.guard.peak = start
         self.marks = {}
-        self.attempt = {"n": self.attempt["n"] + 1, "started": now.isoformat()}
+        nxt = {"n": self.attempt["n"] + 1, "started": now.isoformat()}
+        if self.attempt.get("target"):
+            nxt["target"] = self.attempt["target"]
+        self.attempt = nxt
         self._dirty = True
 
     def _roll_marks(self, equity: float) -> None:
@@ -417,10 +434,19 @@ class Runner:
     def apply_control(self, prices: dict[str, float]) -> None:
         if not self.control_path.exists():
             return
-        cmd = json.loads(self.control_path.read_text()).get("command")
+        data = json.loads(self.control_path.read_text())
+        cmd, value = data.get("command"), data.get("value")
         self.control_path.unlink()
-        log.warning("Команда управления: %s", cmd)
-        if cmd == "pause":
+        log.warning("Команда управления: %s %s", cmd, value if value is not None else "")
+        if cmd in ("cashout", "target"):  # команды режима попыток; остальные счета их пропускают
+            if not self.cfg.challenge.enabled:
+                return
+            if cmd == "cashout":
+                self._finish_attempt("cashout", prices)
+            else:
+                self.attempt["target"] = float(value)
+                self._notify(f"🎯 Новая цель попытки: x{float(value):g}")
+        elif cmd == "pause":
             self.paused = True
         elif cmd == "resume":
             self.paused = False

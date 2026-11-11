@@ -732,7 +732,7 @@ def test_challenge_win_and_bust_restart_attempt(tmp_path):
     runner.check_challenge(px)
     assert [a["outcome"] for a in runner.attempts] == ["win", "bust"]
     assert runner.attempt["n"] == 3 and runner.book.cash == 50.0
-    assert any("слита" in m and "побед 1, сливов 1" in m for m in note.sent)
+    assert any("слита" in m and "побед 1, выводов 0, сливов 1" in m for m in note.sent)
 
     runner.step()
     ch = runner.snapshot["challenge"]
@@ -755,3 +755,49 @@ def test_turbo_config_is_paper_only_and_bounded():
     assert cfg.challenge.enabled and cfg.challenge.target_mult == 10
     assert cfg.portfolio.max_gross_exposure <= 5.0 and cfg.portfolio.initial_capital == 50.0
     assert any(s.config == "config.turbo.toml" for s in load_group(root / "bots.toml"))
+
+
+def test_cashout_and_target_commands(tmp_path):
+    from bot.live import control_path
+    from bot.telegram import CommandListener, Telegram
+
+    cfg = turbo_cfg()
+    market = FakeMarket({"ETH/USDT": trend_frame()})
+    note = FakeNotifier()
+    state = tmp_path / "t.json"
+    runner = Runner(cfg, market, PaperBroker(0.0005, 0.0005), state, note)
+    for _ in range(60):
+        runner.step()
+        market.i += 1
+    assert runner.book.units["ETH/USDT"] > 0
+
+    sent = []
+    listener = CommandListener(Telegram("T", 111, lambda m, p, t: sent.append(p) or {"ok": True}),
+                               bots=[("Турбо", state, control_path(state))])
+    assert "больше 1" in listener.handle("/target")
+    assert "больше 1" in listener.handle("/target 0.5")
+    assert "x3" in listener.handle("/target x3")
+    runner.step()
+    assert runner.target_mult == 3.0 and runner.snapshot["challenge"]["target"] == 3.0
+
+    equity_before = runner.snapshot["equity"]
+    listener.handle("/cashout")
+    runner.step()
+    last = runner.attempts[-1]
+    assert last["outcome"] == "cashout" and last["final"] == pytest.approx(equity_before, rel=0.05)
+    assert runner.book.units["ETH/USDT"] == 0 and runner.book.cash == 50.0
+    assert runner.attempt["n"] == 2 and runner.target_mult == 3.0      # цель переходит на новую попытку
+    msg = [m for m in note.sent if "Вывод по команде" in m][-1]
+    assert "Разбор:" in msg and "выводов 1" in msg
+
+    # цель x3 теперь срабатывает как победа
+    runner.book.cash = 50.0 * 3.1
+    runner.check_challenge(market.prices(["ETH/USDT"]))
+    assert runner.attempts[-1]["outcome"] == "win"
+
+    # обычный счёт команды режима попыток пропускает
+    plain = Runner(make_cfg(), FakeMarket({"ETH/USDT": trend_frame()}),
+                   PaperBroker(0.001, 0.0005), tmp_path / "p.json")
+    control_path(tmp_path / "p.json").write_text(json.dumps({"command": "cashout"}))
+    plain.step()
+    assert plain.attempts == [] and not plain.paused

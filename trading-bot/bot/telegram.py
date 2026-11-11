@@ -106,9 +106,10 @@ class CommandListener(threading.Thread):
                 out.append((name, snap))
         return out
 
-    def _control(self, command: str) -> None:
+    def _control(self, command: str, value: float | None = None) -> None:
+        payload = {"command": command} if value is None else {"command": command, "value": value}
         for _, _, control in self.bots:
-            control.write_text(json.dumps({"command": command}))
+            control.write_text(json.dumps(payload))
 
     def handle(self, text: str) -> str:
         cmd = text.strip().split()[0].split("@")[0].lower() if text.strip() else ""
@@ -131,6 +132,20 @@ class CommandListener(threading.Thread):
         if cmd == "/resume":
             self._control("resume")
             return f"▶️ Пауза снята{scope}."
+        if cmd == "/cashout":
+            self._control("cashout")
+            return ("💰 Вывожу: закрываю позиции счёта в режиме попыток, фиксирую итог "
+                    "и начинаю новую попытку. Итог придёт отдельным сообщением.")
+        if cmd == "/target":
+            parts = text.split()
+            try:
+                value = float(parts[1].lower().lstrip("x").replace(",", "."))
+            except (IndexError, ValueError):
+                value = 0.0
+            if value <= 1.0:
+                return "Укажите цель числом больше 1, например: /target 3"
+            self._control("target", value)
+            return f"🎯 Цель попытки будет x{value:g}."
         if cmd == "/closeall":
             self._control("close-all")
             return f"🔴 Закрываю все позиции{scope} и встаю на паузу. Вернуть в работу: /resume"

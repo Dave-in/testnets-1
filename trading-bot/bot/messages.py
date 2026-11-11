@@ -10,6 +10,7 @@ REASONS = {
     "manual_close_all": "команда «закрыть всё»",
     "challenge_win": "цель попытки достигнута — фиксирую результат",
     "challenge_bust": "попытка закончена — счёт упал до порога слива",
+    "challenge_cashout": "вывод по команде — фиксирую результат",
 }
 
 HELP = (
@@ -19,6 +20,9 @@ HELP = (
     "/pause — не открывать новые сделки (стопы работают)\n"
     "/resume — снять паузу\n"
     "/closeall — продать всё в USDT и встать на паузу\n"
+    "\n<b>Режим попыток (Турбо)</b>\n"
+    "/cashout — вывести сейчас: закрыть позиции, зафиксировать итог, начать новую попытку\n"
+    "/target 3 — сменить цель попытки (здесь: x3)\n"
     "/help — эта справка"
 )
 
@@ -124,8 +128,9 @@ def _challenge(snap: dict) -> list[str]:
         return []
     out = [f"🎯 Попытка №{ch['n']}: сейчас x{ch['mult']:.2f}, цель x{ch['target']:g}, "
            f"слив ниже x{ch['bust']:g}",
-           f"Завершено попыток: побед {ch['won']}, сливов {ch['lost']}"]
-    if ch["won"] + ch["lost"]:
+           f"Завершено попыток: побед {ch['won']}, выводов {ch.get('cashed', 0)}, "
+           f"сливов {ch['lost']}"]
+    if ch["won"] + ch["lost"] + ch.get("cashed", 0):
         out.append(f"Вложено всего {money(ch['spent'])} USDT, возвращено {money(ch['returned'])} USDT")
     return out
 
@@ -138,19 +143,45 @@ def _lessons(snap: dict) -> list[str]:
     return ["", "<b>Последние уроки</b>", *out] if out else []
 
 
+def _attempt_review(attempt: dict) -> list[str]:
+    """Разбор попытки: сколько сделок, на чём заработали и на чём потеряли."""
+    closed = attempt.get("closed") or []
+    if not closed:
+        return ["Разбор: закрытых сделок в попытке не было."]
+    by: dict[str, float] = {}
+    for c in closed:
+        key = f"{c['symbol']} {'лонг' if c['side'] > 0 else 'шорт'}"
+        by[key] = by.get(key, 0.0) + c["pnl"]
+    wins = sum(c["pnl"] > 0 for c in closed)
+    best, worst = max(by, key=by.get), min(by, key=by.get)
+    out = [f"Разбор: сделок {len(closed)}, прибыльных {wins} ({wins / len(closed) * 100:.0f}%)"]
+    if by[best] > 0:
+        out.append(f"Больше всего заработано: {escape(best)} ({signed(by[best])} USDT)")
+    if by[worst] < 0:
+        out.append(f"Больше всего потеряно: {escape(worst)} ({signed(by[worst])} USDT)")
+    return out
+
+
 def challenge_result(attempt: dict, stake: float, history: list[dict]) -> str:
-    won = sum(a["outcome"] == "win" for a in history)
+    count = lambda kind: sum(a["outcome"] == kind for a in history)  # noqa: E731
     spent, got = stake * len(history), sum(a["final"] for a in history)
-    head = (f"🏆 <b>Цель достигнута!</b> Попытка №{attempt['n']}: {money(stake)} → "
-            f"{money(attempt['final'])} USDT (x{attempt['mult']:.1f}) за {attempt['days']:.0f} дн."
-            if attempt["outcome"] == "win" else
-            f"💥 <b>Попытка №{attempt['n']} слита</b>: от {money(stake)} осталось "
-            f"{money(attempt['final'])} USDT за {attempt['days']:.0f} дн.")
+    n, final, days = attempt["n"], money(attempt["final"]), attempt["days"]
+    if attempt["outcome"] == "win":
+        head = (f"🏆 <b>Цель достигнута!</b> Попытка №{n}: {money(stake)} → {final} USDT "
+                f"(x{attempt['mult']:.1f}) за {days:.0f} дн.")
+    elif attempt["outcome"] == "cashout":
+        head = (f"💰 <b>Вывод по команде.</b> Попытка №{n}: {money(stake)} → {final} USDT "
+                f"(x{attempt['mult']:.2f}) за {days:.0f} дн.")
+    else:
+        head = (f"💥 <b>Попытка №{n} слита</b>: от {money(stake)} осталось {final} USDT "
+                f"за {days:.0f} дн.")
     return "\n".join([
         head,
-        f"Всего попыток: {len(history)}, побед {won}, сливов {len(history) - won}",
+        *_attempt_review(attempt),
+        f"Всего попыток: {len(history)} — побед {count('win')}, выводов {count('cashout')}, "
+        f"сливов {count('bust')}",
         f"Вложено {money(spent)} USDT, возвращено {money(got)} USDT, итог {signed(got - spent)} USDT",
-        f"Начинаю попытку №{attempt['n'] + 1} с {money(stake)} USDT.",
+        f"Начинаю попытку №{n + 1} с {money(stake)} USDT.",
     ])
 
 
