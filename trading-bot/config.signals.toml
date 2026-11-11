@@ -1,0 +1,62 @@
+# Сигнальный бот: советы «купить / продать» в Telegram + виртуальный счёт на реальных ценах Binance.
+#   cp config.signals.toml config.toml   (или запускайте с --config config.signals.toml)
+# Стратегия выбрана по бэктестам на истории Binance 2019–2026 (см. PROJECT_NOTES.md).
+
+[exchange]
+name = "binance"
+mode = "paper"            # виртуальный счёт; реальных ордеров нет, ключи биржи не нужны
+timeframe = "1d"          # решения раз в сутки, после закрытия дня (00:00 UTC)
+fee = 0.001               # комиссия 0.1% — учитывается и на виртуальном счёте
+slippage = 0.0005
+
+[portfolio]
+profile = "signals"
+initial_capital = 10000.0   # размер виртуального счёта, USDT
+max_gross_exposure = 1.0    # без плеча
+monthly_target = 0.03       # для отчёта бэктеста: сколько месяцев дали >= 3%
+
+# Монеты Binance и максимальная доля каждой в счёте. Бот держит до max_positions сильнейших.
+[portfolio.profiles.signals]
+"BTC/USDT" = 0.40
+"ETH/USDT" = 0.40
+"SOL/USDT" = 0.30
+"BNB/USDT" = 0.30
+"XRP/USDT" = 0.30
+"DOGE/USDT" = 0.25
+"AVAX/USDT" = 0.25
+"LINK/USDT" = 0.25
+"ADA/USDT" = 0.25
+
+[strategy]
+entry_mode = "ema"
+fast_ema = 20               # вход: цена > EMA20 > EMA100 и рост за 30 дней
+slow_ema = 100
+momentum_lookback = 30
+atr_period = 14
+atr_stop_mult = 3.5         # трейлинг-стоп: максимум закрытия − 3.5·ATR
+vol_lookback = 20
+target_vol = 0.25           # целевой риск счёта: 25% годовой волатильности
+rebalance_threshold = 0.4   # меньше мелких «докупить/сократить» → меньше сообщений и комиссий
+min_trade = 0.02
+reentry_cooldown_bars = 3
+max_positions = 4
+regime_symbol = "BTC/USDT"  # фильтр рынка: торгуем, только пока BTC выше своей EMA200…
+regime_ema = 200
+regime_exit = true          # …иначе выходим в USDT и ждём
+
+[risk]
+# Режим "scale": чем глубже просадка от исторического пика, тем меньше позиции.
+hard_stop_action = "scale"
+soft_drawdown = 0.05        # с −5% начинаем урезать
+hard_drawdown = 0.15        # на −15% и глубже торгуем на 40% обычного размера
+soft_scale = 0.4
+cooldown_bars = 5
+resume_drawdown = 0.10
+
+[live]
+poll_seconds = 60           # проверка цен и стопов раз в минуту
+state_dir = "state"
+
+[telegram]
+enabled = true              # токен и chat_id — в файле .env (см. README)
+daily_report = true         # отчёт каждый день в 00:00 UTC

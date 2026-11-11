@@ -215,3 +215,149 @@ def test_top_n_keeps_strongest():
             "SOL/USDT": pd.Series({"mom": 0.9, "vol": 3.0})}
     wants = d._top_n({s: True for s in rows}, rows)
     assert wants == {"ETH/USDT": True, "BTC/USDT": False, "SOL/USDT": False}
+
+
+# --- сигнальный бот: Telegram, виртуальный счёт, фильтр рынка ---------------
+
+class FakeNotifier:
+    def __init__(self):
+        self.sent = []
+
+    def send(self, text):
+        self.sent.append(text)
+        return True
+
+
+def test_runner_sends_signals_and_tracks_pnl(tmp_path):
+    cfg = make_cfg()
+    market = FakeMarket({"ETH/USDT": trend_frame()})
+    note = FakeNotifier()
+    runner = Runner(cfg, market, PaperBroker(0.001, 0.0005), tmp_path / "s.json", note)
+    for _ in range(240):  # рост → вход, затем обвал → выход
+        runner.step()
+        market.i += 1
+    buys = [m for m in note.sent if "КУПИТЬ ETH/USDT" in m]
+    sells = [m for m in note.sent if "ПРОДАТЬ ETH/USDT" in m]
+    assert buys and "Стоп:" in buys[0] and "Виртуальный счёт" in buys[0]
+    assert sells and "Итог сделки" in sells[-1]
+    assert runner.stats["closed"] >= 1
+    # учёт сходится: стартовый капитал + зафиксированный результат = кэш (позиций нет)
+    assert runner.book.units["ETH/USDT"] == 0
+    assert runner.book.cash == pytest.approx(cfg.portfolio.initial_capital + runner.stats["realized"])
+    snap = json.loads((tmp_path / "s.json").read_text())["snapshot"]
+    assert snap["equity"] == pytest.approx(runner.book.cash) and snap["positions"] == []
+
+
+def test_daily_report_on_new_day(tmp_path):
+    cfg = make_cfg()
+    cfg.telegram.daily_report = True
+    market = FakeMarket({"ETH/USDT": trend_frame()})
+    note = FakeNotifier()
+    runner = Runner(cfg, market, PaperBroker(0.001, 0.0005), tmp_path / "s.json", note)
+    runner.step()                      # первый запуск — отчёта ещё нет
+    assert not any("Отчёт за день" in m for m in note.sent)
+    runner.marks["day"] = "2000-01-01"  # «вчера»
+    runner.step()
+    assert sum("Отчёт за день" in m for m in note.sent) == 1
+    runner.step()                      # в тот же день повторно не шлём
+    assert sum("Отчёт за день" in m for m in note.sent) == 1
+
+
+def test_telegram_commands(tmp_path):
+    from bot.telegram import CommandListener, Telegram
+
+    sent, queue = [], []
+
+    def post(method, payload, timeout):
+        if method == "getUpdates":
+            items, queue[:] = list(queue), []
+            return {"ok": True, "result": items}
+        sent.append(payload)
+        return {"ok": True}
+
+    def msg(i, chat, text):
+        return {"update_id": i, "message": {"chat": {"id": chat}, "text": text}}
+
+    state, control = tmp_path / "s.json", tmp_path / "s_control.json"
+    listener = CommandListener(Telegram("T", 111, post), state, control)
+
+    queue.append(msg(1, 999, "/closeall"))        # чужой чат — игнор
+    listener.poll_once()
+    assert not sent and not control.exists()
+
+    queue.append(msg(2, 111, "/status"))          # состояния ещё нет
+    listener.poll_once()
+    assert "ещё не сохранил" in sent[-1]["text"]
+
+    cfg = make_cfg()
+    runner = Runner(cfg, FakeMarket({"ETH/USDT": trend_frame()}), PaperBroker(0.001, 0.0005), state)
+    runner.step()
+    queue.extend([msg(3, 111, "/status"), msg(4, 111, "/report@my_bot"), msg(5, 111, "/pause")])
+    listener.poll_once()
+    texts = [p["text"] for p in sent]
+    assert any("Статус" in t and "Счёт:" in t and "USDT" in t for t in texts)
+    assert any("С запуска" in t for t in texts)
+    assert json.loads(control.read_text()) == {"command": "pause"}
+    assert all(p["chat_id"] == "111" for p in sent)
+    runner.step()
+    assert runner.paused
+
+
+def test_regime_filter_blocks_trading():
+    cfg = make_cfg()
+    cfg.strategy.regime_symbol = "BTC/USDT"
+    eth = trend_frame()
+    falling = trend_frame(up_until=0)             # «BTC» всё время падает
+    res = Backtester(cfg, {"ETH/USDT": eth, "BTC/USDT": falling}).run()
+    assert len(res.trades) == 0
+    rising = trend_frame(up_until=10_000, seed=5)  # «BTC» всё время растёт
+    res = Backtester(cfg, {"ETH/USDT": eth, "BTC/USDT": rising}).run()
+    assert len(res.trades) > 0
+
+
+def test_guard_scale_mode_never_stops():
+    g = DrawdownGuard(RiskConfig(hard_stop_action="scale", soft_drawdown=0.05, hard_drawdown=0.15,
+                                 soft_scale=0.4), peak=100)
+    assert g.on_bar_close(100) == 1.0
+    assert g.on_bar_close(90) == pytest.approx(0.7)   # −10%: посередине
+    assert g.on_bar_close(50) == pytest.approx(0.4)   # глубже лимита — минимальный размер
+    assert not g.check_intrabar(50) and not g.active
+    assert g.peak == 100                               # пик не сбрасывается
+
+
+def test_load_csv_with_text_dates(tmp_path):
+    from bot.data import load_csv
+
+    df = trend_frame(n=5)
+    path = tmp_path / "x.csv"
+    df.to_csv(path)                                    # даты строками — как пишет download
+    back = load_csv(path)
+    assert len(back) == 5 and back["close"].iloc[-1] == pytest.approx(df["close"].iloc[-1])
+
+
+def test_binance_public_falls_back_to_mirror():
+    from bot.binance_public import BinancePublic
+
+    class Resp:
+        def __init__(self, code, data):
+            self.status_code, self._data, self.text = code, data, str(data)
+
+        def json(self):
+            return self._data
+
+    class Session:
+        calls = []
+
+        def get(self, url, params, timeout):
+            self.calls.append(url)
+            if url.startswith("https://blocked"):
+                return Resp(451, {"msg": "restricted location"})
+            return Resp(200, [{"symbol": "ETHUSDT", "price": "2000.5"},
+                              {"symbol": "BTCUSDT", "price": "80000"}])
+
+    pub = BinancePublic(hosts=["https://blocked", "https://mirror"])
+    pub.session = Session()
+    assert pub.prices(["ETH/USDT"]) == {"ETH/USDT": 2000.5}
+    assert pub.hosts[0] == "https://mirror"           # рабочий адрес запомнили
+    with pytest.raises(RuntimeError):
+        pub.prices(["NOPE/USDT"])

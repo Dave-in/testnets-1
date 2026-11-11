@@ -6,6 +6,9 @@
     После паузы торговля возобновляется с урезанным риском: отсчет просадки
     идет так, будто бот уже потерял resume_drawdown (режим "pause"),
     либо бот останавливается до ручного вмешательства (режим "halt").
+  * Режим "scale": жесткого стопа нет. Чем глубже просадка от исторического пика,
+    тем меньше позиции (у hard_drawdown и глубже — soft_scale от обычного размера).
+    Пик не сбрасывается, поэтому бот не может "забыть" о потерях.
 
 Проверка жесткого лимита идет и внутри бара (в live — при каждом опросе цены),
 поэтому фактический убыток обычно близок к лимиту, но при гэпах может быть больше.
@@ -35,7 +38,7 @@ class DrawdownGuard:
 
     def check_intrabar(self, equity: float, ts=None) -> bool:
         """Проверка жесткого лимита. True — нужно немедленно закрыть всё."""
-        if self.active:
+        if self.active or self.cfg.hard_stop_action == "scale":
             return False
         if self.drawdown(equity) >= self.cfg.hard_drawdown:
             self._trigger_hard(equity, ts)
@@ -57,7 +60,9 @@ class DrawdownGuard:
 
         self.peak = max(self.peak, equity)
         dd = self.drawdown(equity)
-        if dd >= self.cfg.hard_drawdown:
+        if self.cfg.hard_stop_action == "scale":
+            dd = min(dd, self.cfg.hard_drawdown)
+        elif dd >= self.cfg.hard_drawdown:
             self._trigger_hard(equity, ts)
             return 0.0
         if dd >= self.cfg.soft_drawdown:

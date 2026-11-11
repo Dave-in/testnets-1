@@ -45,7 +45,23 @@ def prepare(df: pd.DataFrame, cfg: StrategyConfig, timeframe: str) -> pd.DataFra
     out["atr"] = atr(out, cfg.atr_period)
     out["vol"] = realized_vol(out["close"], cfg.vol_lookback, timeframe)
     out["mom"] = out["close"] / out["close"].shift(cfg.momentum_lookback) - 1
+    # максимум/минимум ПРЕДЫДУЩИХ баров (текущий не входит — иначе пробой невозможен)
+    out["hh"] = out["high"].rolling(cfg.breakout_lookback).max().shift(1)
+    if cfg.exit_lookback > 0:
+        out["ll"] = out["low"].rolling(cfg.exit_lookback).min().shift(1)
+    out["regime_ok"] = True
     return out
+
+
+def add_regime(frames: dict[str, pd.DataFrame], regime_df: pd.DataFrame | None,
+               cfg: StrategyConfig) -> None:
+    """Проставляет в каждый фрейм колонку regime_ok: рынок в целом растёт
+    (regime_symbol закрылся выше своей EMA). regime_df — свечи regime_symbol."""
+    if not cfg.regime_symbol or regime_df is None:
+        return
+    ok = regime_df["close"] > ema(regime_df["close"], cfg.regime_ema)
+    for df in frames.values():
+        df["regime_ok"] = ok.reindex(df.index).ffill().fillna(False).astype(bool)
 
 
 def _ready(row: pd.Series) -> bool:
@@ -66,7 +82,9 @@ def update_signal(row: pd.Series, st: SymbolState, cfg: StrategyConfig) -> bool:
         st.highest_close = max(st.highest_close, close)
         st.stop = max(st.stop, st.highest_close - cfg.atr_stop_mult * float(row["atr"]))
         trend_broken = close < row["ema_slow"] or row["ema_fast"] < row["ema_slow"]
-        if close <= st.stop or trend_broken:
+        regime_bad = cfg.regime_exit and not bool(row["regime_ok"])
+        channel_exit = cfg.exit_lookback > 0 and close < row["ll"]
+        if close <= st.stop or trend_broken or regime_bad or channel_exit:
             exit_position(st, cfg)
         return st.in_position
 
@@ -74,7 +92,13 @@ def update_signal(row: pd.Series, st: SymbolState, cfg: StrategyConfig) -> bool:
         st.cooldown_left -= 1
         return False
 
-    if close > row["ema_fast"] > row["ema_slow"] and row["mom"] > 0:
+    if not bool(row["regime_ok"]):
+        return False
+    if cfg.entry_mode == "breakout":
+        entry = close > row["hh"] and close > row["ema_slow"] and row["mom"] > 0
+    else:
+        entry = close > row["ema_fast"] > row["ema_slow"] and row["mom"] > 0
+    if entry:
         st.in_position = True
         st.highest_close = close
         st.stop = close - cfg.atr_stop_mult * float(row["atr"])

@@ -17,7 +17,7 @@ from . import metrics
 from .config import Config
 from .core import Decider, rebalance_deltas
 from .indicators import periods_per_year
-from .strategy import prepare
+from .strategy import add_regime, prepare
 
 
 @dataclass
@@ -38,6 +38,10 @@ class Backtester:
             raise ValueError(f"Нет данных для: {missing}")
         tf = cfg.exchange.timeframe
         prepared = {s: prepare(data[s], cfg.strategy, tf) for s in self.symbols}
+        if cfg.strategy.regime_symbol:
+            if cfg.strategy.regime_symbol not in data:
+                raise ValueError(f"Нет данных для фильтра режима: {cfg.strategy.regime_symbol}")
+            add_regime(prepared, data[cfg.strategy.regime_symbol], cfg.strategy)
         index = sorted(set().union(*(df.index for df in prepared.values())))
         self.frames = {s: df.reindex(index) for s, df in prepared.items()}
         self.index = pd.DatetimeIndex(index)

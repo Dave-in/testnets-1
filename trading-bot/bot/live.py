@@ -22,11 +22,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from . import messages
 from .brokers import Book, ExchangeBroker, PaperBroker
 from .config import Config
 from .core import Decider, rebalance_deltas
 from .data import _to_frame, make_exchange
-from .strategy import prepare
+from .strategy import add_regime, prepare
 
 log = logging.getLogger(__name__)
 
@@ -51,15 +52,26 @@ class CcxtMarketData:
 
 
 class Runner:
-    def __init__(self, cfg: Config, market, broker, state_path: str | Path):
+    def __init__(self, cfg: Config, market, broker, state_path: str | Path, notifier=None):
         self.cfg = cfg
         self.market = market
         self.broker = broker
+        self.notifier = notifier     # объект с методом send(text) или None
         self.symbols = cfg.portfolio.symbols
         self.state_path = Path(state_path)
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self.decider = Decider(cfg, cfg.portfolio.initial_capital)
-        self.book = Book(cash=cfg.portfolio.initial_capital, units={s: 0.0 for s in self.symbols})
+        self.book = Book(cash=cfg.portfolio.initial_capital, units={s: 0.0 for s in self.symbols},
+                         cost={s: 0.0 for s in self.symbols})
+        self.pos_pnl = {s: 0.0 for s in self.symbols}   # зафиксировано по текущей позиции
+        self.pos_invested = {s: 0.0 for s in self.symbols}  # всего вложено в текущую позицию
+        self._prices: dict[str, float] = {}
+        self.stats = {"closed": 0, "wins": 0, "realized": 0.0, "fees": 0.0}
+        self.marks: dict = {}        # капитал на начало дня/месяца — для отчётов
+        self.regime_ok = True
+        self.snapshot: dict = {}
+        self._dirty = True           # были сделки/новый бар → записать точку в журнал капитала
+        self._last_journal_hour = ""
         self.last_bar: str | None = None
         self.paused = False          # пауза по команде: новых сделок нет, стопы работают
         self.stop_requested = False
@@ -73,7 +85,14 @@ class Runner:
             return
         st = json.loads(self.state_path.read_text())
         self.book = Book(cash=st["book"]["cash"],
-                         units={s: st["book"]["units"].get(s, 0.0) for s in self.symbols})
+                         units={s: st["book"]["units"].get(s, 0.0) for s in self.symbols},
+                         cost={s: st["book"].get("cost", {}).get(s, 0.0) for s in self.symbols})
+        self.pos_pnl.update({s: v for s, v in st.get("pos_pnl", {}).items() if s in self.pos_pnl})
+        self.pos_invested.update({s: v for s, v in st.get("pos_invested", {}).items()
+                                  if s in self.pos_invested})
+        self.stats.update(st.get("stats", {}))
+        self.marks = st.get("marks", {})
+        self.regime_ok = st.get("regime_ok", True)
         self.decider.load_dict(st["decider"])
         self.last_bar = st.get("last_bar")
         self.paused = st.get("paused", False)
@@ -83,7 +102,13 @@ class Runner:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path.with_suffix(".tmp")
         tmp.write_text(json.dumps({
-            "book": {"cash": self.book.cash, "units": self.book.units},
+            "book": {"cash": self.book.cash, "units": self.book.units, "cost": self.book.cost},
+            "pos_pnl": self.pos_pnl,
+            "pos_invested": self.pos_invested,
+            "stats": self.stats,
+            "marks": self.marks,
+            "regime_ok": self.regime_ok,
+            "snapshot": self.snapshot,
             "decider": self.decider.to_dict(),
             "last_bar": self.last_bar,
             "paused": self.paused,
@@ -112,19 +137,53 @@ class Runner:
         fill = self.broker.market_order(symbol, side, units, price)
         if fill is None:
             return
+        before = self.book.units[symbol]
+        pnl = position_pnl = position_ret = None
         if side == "buy":
             self.book.cash -= fill.cost
             self.book.units[symbol] += fill.units
+            self.book.cost[symbol] += fill.cost
+            self.pos_invested[symbol] += fill.cost
         else:
+            sold_cost = self.book.cost[symbol] * min(1.0, fill.units / before) if before > 0 else 0.0
+            pnl = fill.cost - sold_cost
             self.book.cash += fill.cost
-            self.book.units[symbol] = max(0.0, self.book.units[symbol] - fill.units)
-            if self.book.units[symbol] * price < 1.0:  # пыль после округления
-                self.book.units[symbol] = 0.0
+            self.book.units[symbol] = max(0.0, before - fill.units)
+            self.book.cost[symbol] -= sold_cost
+            self.pos_pnl[symbol] += pnl
+            self.stats["realized"] += pnl
+            if self.book.units[symbol] * price < 1.0:  # пыль после округления → позиция закрыта
+                invested = self.pos_invested[symbol]
+                position_pnl = self.pos_pnl[symbol]
+                position_ret = position_pnl / invested if invested > 0 else None
+                self.stats["closed"] += 1
+                self.stats["wins"] += position_pnl > 0
+                self.book.units[symbol] = self.book.cost[symbol] = 0.0
+                self.pos_pnl[symbol] = self.pos_invested[symbol] = 0.0
+        self.stats["fees"] += fill.fee
+        self._dirty = True
         log.info("%s %s %.6f @ %.4f (комиссия %.4f) — %s",
                  side.upper(), symbol, fill.units, fill.price, fill.fee, reason)
         self._journal("trades", {"ts": datetime.now(timezone.utc).isoformat(), "symbol": symbol,
                                  "side": side, "units": fill.units, "price": fill.price,
-                                 "fee": fill.fee, "reason": reason})
+                                 "fee": fill.fee, "reason": reason,
+                                 "pnl": "" if pnl is None else round(pnl, 4)})
+        prices = {**self._prices, symbol: price}
+        equity = self.book.cash + sum(u * prices.get(s, 0.0) for s, u in self.book.units.items())
+        self._notify(messages.trade_message(
+            symbol=symbol, side=side, fill_price=fill.price, notional=fill.units * fill.price,
+            reason=reason, units_before=before, units_after=self.book.units[symbol],
+            equity=equity, weight_after=self.book.units[symbol] * price / equity if equity else 0,
+            stop=self.decider.states[symbol].stop, position_pnl=position_pnl,
+            position_ret=position_ret, virtual=self.cfg.exchange.mode != "live"))
+
+    def _notify(self, text: str) -> None:
+        if self.notifier is None:
+            return
+        try:
+            self.notifier.send(text)
+        except Exception:  # noqa: BLE001 — уведомления не должны ронять торговлю
+            log.exception("Не удалось отправить уведомление")
 
     def _sell_all(self, symbol: str, price: float, reason: str) -> None:
         self._execute(symbol, "sell", self.book.units[symbol], price, reason)
@@ -138,6 +197,8 @@ class Runner:
         if self.decider.guard.check_intrabar(equity, datetime.now(timezone.utc)):
             log.warning("ЛИМИТ ПРОСАДКИ: капитал %.2f, пик %.2f — закрываем всё",
                         equity, self.decider.guard.peak)
+            self._notify(f"⚠️ <b>Лимит просадки</b>: счёт {messages.money(equity)} USDT, "
+                         f"пик {messages.money(self.decider.guard.peak)}. Закрываю все позиции.")
             for s in self.symbols:
                 self._sell_all(s, prices[s], "drawdown_guard")
             self.decider.reset_signals()
@@ -145,13 +206,23 @@ class Runner:
     def on_new_bar(self, prices: dict[str, float]) -> str | None:
         """Если закрылся новый бар — пересчет сигналов и ребалансировка."""
         tf = self.cfg.exchange.timeframe
-        frames = {s: prepare(self.market.closed_ohlcv(s, tf, self.history_limit),
-                             self.cfg.strategy, tf) for s in self.symbols}
-        bar_ts = max(str(df.index[-1]) for df in frames.values() if len(df))
+        raw = {s: self.market.closed_ohlcv(s, tf, self.history_limit) for s in self.symbols}
+        bar_ts = max(str(df.index[-1]) for df in raw.values() if len(df))
         if bar_ts == self.last_bar:
             return None
 
+        frames = {s: prepare(df, self.cfg.strategy, tf) for s, df in raw.items()}
+        regime = self.cfg.strategy.regime_symbol
+        if regime:
+            regime_df = raw[regime] if regime in raw else self.market.closed_ohlcv(
+                regime, tf, self.history_limit)
+            add_regime(frames, regime_df, self.cfg.strategy)
         rows = {s: df.iloc[-1] for s, df in frames.items() if len(df)}
+        was_ok, self.regime_ok = self.regime_ok, all(bool(r["regime_ok"]) for r in rows.values())
+        if was_ok != self.regime_ok:
+            self._notify("🌤 Рынок снова растёт (BTC выше своей средней) — бот возвращается к сделкам."
+                         if self.regime_ok else
+                         "🌧 Рынок ослаб (BTC ниже своей средней) — бот выходит в USDT и ждёт.")
         n = self.cfg.strategy.vol_lookback
         rets = pd.DataFrame({s: np.log(df["close"]).diff().iloc[-n:] for s, df in frames.items()})
         close_prices = {s: float(rows[s]["close"]) for s in rows}
@@ -170,7 +241,46 @@ class Runner:
             side = "buy" if diff_units > 0 else "sell"
             self._execute(s, side, abs(diff_units), prices[s], "rebalance")
         self.last_bar = bar_ts
+        self._dirty = True
         return bar_ts
+
+    def make_snapshot(self, prices: dict[str, float]) -> dict:
+        """Срез состояния для /status, /report и ctl status."""
+        equity = self.book.equity(prices)
+        start = self.cfg.portfolio.initial_capital
+        positions = []
+        for s, u in self.book.units.items():
+            if u <= 0:
+                continue
+            value, cost = u * prices[s], self.book.cost[s]
+            positions.append({"symbol": s, "units": u, "value": value,
+                              "weight": value / equity if equity else 0.0,
+                              "ret": value / cost - 1 if cost > 0 else 0.0,
+                              "stop": self.decider.states[s].stop})
+        guard = self.decider.guard
+        return {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "mode": self.cfg.exchange.mode, "exchange": self.cfg.exchange.name,
+            "equity": equity, "cash": self.book.cash, "start_equity": start,
+            "drawdown": guard.drawdown(equity), "peak": guard.peak,
+            "paused": self.paused, "halted": guard.halted, "guard_paused_left": guard.paused_left,
+            "regime_ok": self.regime_ok,
+            "day_ret": equity / self.marks.get("day_equity", equity) - 1,
+            "month_ret": equity / self.marks.get("month_equity", equity) - 1,
+            "total_ret": equity / start - 1,
+            "positions": positions, "stats": dict(self.stats),
+        }
+
+    def _roll_marks(self, equity: float) -> None:
+        """Смена суток (UTC): дневной отчёт и новые точки отсчёта для дня и месяца."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self.marks.get("day") == today:
+            return
+        if self.marks.get("day") and self.cfg.telegram.daily_report:
+            self._notify(messages.report_text(self.snapshot, "Отчёт за день"))
+        self.marks.update(day=today, day_equity=equity)
+        if self.marks.get("month") != today[:7]:
+            self.marks.update(month=today[:7], month_equity=equity)
 
     @property
     def control_path(self) -> Path:
@@ -186,6 +296,7 @@ class Runner:
             self.paused = True
         elif cmd == "resume":
             self.paused = False
+            self.last_bar = None  # сразу пересчитать сигналы, не дожидаясь нового бара
         elif cmd == "close-all":
             for s in self.symbols:
                 self._sell_all(s, prices[s], "manual_close_all")
@@ -197,30 +308,50 @@ class Runner:
             log.error("Неизвестная команда: %s", cmd)
 
     def step(self) -> None:
-        prices = self.market.prices(self.symbols)
+        prices = self._prices = self.market.prices(self.symbols)
         self.apply_control(prices)
         self.check_risk(prices)
         if not self.paused:
             self.on_new_bar(prices)
         equity = self.book.equity(prices)
-        self._journal("equity", {"ts": datetime.now(timezone.utc).isoformat(), "equity": equity,
-                                 "cash": self.book.cash, "peak": self.decider.guard.peak,
-                                 "drawdown": self.decider.guard.drawdown(equity),
-                                 "paused": self.paused})
+        self.snapshot = self.make_snapshot(prices)
+        self._roll_marks(equity)
+        hour = self.snapshot["ts"][:13]
+        if self._dirty or hour != self._last_journal_hour:  # не чаще раза в час + после сделок
+            self._journal("equity", {"ts": self.snapshot["ts"], "equity": equity,
+                                     "cash": self.book.cash, "peak": self.decider.guard.peak,
+                                     "drawdown": self.decider.guard.drawdown(equity),
+                                     "paused": self.paused})
+            self._dirty, self._last_journal_hour = False, hour
         self._save()
 
+    def _wait(self, seconds: int) -> None:
+        """Пауза между шагами; прерывается, если пришла команда управления."""
+        for _ in range(max(1, seconds)):
+            if self.control_path.exists():
+                return
+            time.sleep(1)
+
     def run(self, once: bool = False) -> None:
+        errors = 0
         while True:
             try:
                 self.step()
+                if errors >= 5:
+                    self._notify("✅ Связь с биржей восстановлена, бот снова работает.")
+                errors = 0
             except KeyboardInterrupt:
                 raise
-            except Exception:  # сеть/биржа: логируем и пробуем на следующем круге
+            except Exception as e:  # сеть/биржа: логируем и пробуем на следующем круге
+                errors += 1
                 log.exception("Ошибка на шаге, повтор через %ss", self.cfg.live.poll_seconds)
+                if errors == 5:
+                    self._notify(f"⚠️ Бот 5 раз подряд не смог выполнить шаг: "
+                                 f"{messages.escape(str(e))[:200]}. Продолжаю попытки.")
             if once or self.stop_requested:
                 log.info("Бот остановлен. Позиции сохранены в %s", self.state_path)
                 return
-            time.sleep(self.cfg.live.poll_seconds)
+            self._wait(self.cfg.live.poll_seconds)
 
 
 def control_path(state_path: Path) -> Path:
@@ -235,7 +366,12 @@ def state_path_for(cfg: Config) -> Path:
 def build_runner(cfg: Config, confirm_live: bool = False) -> Runner:
     mode = cfg.exchange.mode
     name = cfg.exchange.name
-    market = CcxtMarketData(name)  # сигналы всегда по ценам основной биржи
+    # сигналы всегда по ценам основной биржи
+    if name == "binance":
+        from .binance_public import BinancePublic
+        market = BinancePublic()
+    else:
+        market = CcxtMarketData(name)
     if mode == "paper":
         broker = PaperBroker(cfg.exchange.fee, cfg.exchange.slippage)
     elif mode in ("testnet", "live"):
@@ -250,4 +386,19 @@ def build_runner(cfg: Config, confirm_live: bool = False) -> Runner:
                                 cfg.exchange.fee)
     else:
         raise SystemExit(f"Неизвестный режим: {mode}")
-    return Runner(cfg, market, broker, state_path_for(cfg))
+    state = state_path_for(cfg)
+    notifier = None
+    if cfg.telegram.enabled:
+        from .telegram import CommandListener, Telegram
+
+        token, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
+        if not token or not chat:
+            raise SystemExit("Telegram включён, но нет TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID. "
+                             "См. README, раздел «Telegram».")
+        notifier = Telegram(token, chat)
+        state.parent.mkdir(parents=True, exist_ok=True)
+        CommandListener(Telegram(token, chat), state, control_path(state)).start()
+    runner = Runner(cfg, market, broker, state, notifier)
+    runner._notify(f"🤖 Бот запущен: режим <b>{mode}</b>, {name}, "
+                   f"монет: {len(cfg.portfolio.symbols)}. /help — команды.")
+    return runner

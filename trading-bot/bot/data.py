@@ -57,11 +57,18 @@ def fetch_ohlcv(exchange, symbol: str, timeframe: str, since: str, until: str | 
 
 def download(exchange_name: str, symbols: list[str], timeframe: str, since: str,
              until: str | None, data_dir: str | Path) -> dict[str, Path]:
-    ex = make_exchange(exchange_name)
-    ex.load_markets()
+    if exchange_name == "binance":
+        from .binance_public import BinancePublic
+
+        pub = BinancePublic()
+        fetch = lambda sym: pub.history(sym, timeframe, since, until)  # noqa: E731
+    else:
+        ex = make_exchange(exchange_name)
+        ex.load_markets()
+        fetch = lambda sym: fetch_ohlcv(ex, sym, timeframe, since, until)  # noqa: E731
     out = {}
     for sym in symbols:
-        df = fetch_ohlcv(ex, sym, timeframe, since, until)
+        df = fetch(sym)
         path = cache_path(data_dir, exchange_name, sym, timeframe)
         path.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(path)
@@ -74,7 +81,7 @@ def load_csv(path: str | Path) -> pd.DataFrame:
     """CSV с колонками ts,open,high,low,close,volume (ts — дата или unix ms)."""
     df = pd.read_csv(path)
     ts = df.columns[0]
-    if np.issubdtype(df[ts].dtype, np.number):
+    if pd.api.types.is_numeric_dtype(df[ts]):
         idx = pd.to_datetime(df[ts], unit="ms", utc=True)
     else:
         idx = pd.to_datetime(df[ts], utc=True)

@@ -49,10 +49,19 @@ class StrategyConfig:
     min_trade: float = 0.01
     reentry_cooldown_bars: int = 5
     max_positions: int = 0  # 0 — без ограничения; N — держим только N сильнейших
+    # Фильтр режима рынка: торгуем, только когда regime_symbol выше своей EMA(regime_ema).
+    regime_symbol: str = ""       # например "BTC/USDT"; пусто — фильтр выключен
+    regime_ema: int = 200
+    regime_exit: bool = True      # True — при плохом режиме выходим из всех позиций
+    # Вход: "ema" — тренд по средним; "breakout" — пробой максимума за breakout_lookback баров
+    entry_mode: str = "ema"
+    breakout_lookback: int = 20
+    exit_lookback: int = 0        # > 0: выход при закрытии ниже минимума за N баров
 
     @property
     def warmup(self) -> int:
-        return max(self.slow_ema, self.momentum_lookback, self.vol_lookback, self.atr_period) + 1
+        return max(self.slow_ema, self.momentum_lookback, self.vol_lookback, self.atr_period,
+                   self.regime_ema if self.regime_symbol else 0, self.breakout_lookback) + 1
 
 
 @dataclass
@@ -72,12 +81,19 @@ class LiveConfig:
 
 
 @dataclass
+class TelegramConfig:
+    enabled: bool = False       # токен и chat_id — в окружении / .env, не в конфиге
+    daily_report: bool = True   # отчёт раз в сутки (в 00:00 UTC, после закрытия дня)
+
+
+@dataclass
 class Config:
     exchange: ExchangeConfig = field(default_factory=ExchangeConfig)
     portfolio: PortfolioConfig = field(default_factory=PortfolioConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     live: LiveConfig = field(default_factory=LiveConfig)
+    telegram: TelegramConfig = field(default_factory=TelegramConfig)
 
 
 def load_config(path: str | Path) -> Config:
@@ -89,4 +105,5 @@ def load_config(path: str | Path) -> Config:
         strategy=StrategyConfig(**raw.get("strategy", {})),
         risk=RiskConfig(**raw.get("risk", {})),
         live=LiveConfig(**raw.get("live", {})),
+        telegram=TelegramConfig(**raw.get("telegram", {})),
     )

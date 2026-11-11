@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import re
 import sys
 from pathlib import Path
 
@@ -21,6 +23,23 @@ from . import data, metrics, report
 from .backtest import Backtester
 from .config import Config, load_config
 from .indicators import periods_per_year
+
+
+def _load_env(path: str = ".env") -> None:
+    """Читает KEY=VALUE из .env (ключи бирж, токен Telegram), не затирая уже заданное."""
+    p = Path(path)
+    if not p.exists():
+        return
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+def _symbols_with_regime(cfg: Config) -> list[str]:
+    extra = cfg.strategy.regime_symbol
+    return cfg.portfolio.symbols + ([extra] if extra and extra not in cfg.portfolio.symbols else [])
 
 
 def _cfg(args) -> Config:
@@ -42,13 +61,14 @@ def _load_data(cfg: Config, args) -> dict[str, pd.DataFrame]:
     if args.synthetic:
         return data.synthetic(cfg.portfolio.symbols, bars=args.bars, timeframe=cfg.exchange.timeframe)
     # индикаторы прогреваются на данных ДО --start, торговля начинается с --start
-    return data.load_cached(args.data_dir, cfg.exchange.name, cfg.portfolio.symbols,
+    return data.load_cached(args.data_dir, cfg.exchange.name, _symbols_with_regime(cfg),
                             cfg.exchange.timeframe, end=args.end)
 
 
 def cmd_download(args) -> None:
     cfg = _cfg(args)
-    symbols = args.symbols or sorted({s for p in cfg.portfolio.profiles.values() for s in p})
+    symbols = args.symbols or sorted({s for p in cfg.portfolio.profiles.values() for s in p}
+                                     | set(_symbols_with_regime(cfg)))
     data.download(cfg.exchange.name, symbols, cfg.exchange.timeframe, args.since, args.until,
                   args.data_dir)
 
@@ -62,7 +82,7 @@ def cmd_backtest(args) -> None:
              + (" — СИНТЕТИКА" if args.synthetic else ""))
     print(title + "\n")
     report.print_summary(res)
-    close = pd.DataFrame({s: df["close"] for s, df in frames.items()})
+    close = pd.DataFrame({s: frames[s]["close"] for s in cfg.portfolio.symbols})
     report.print_monthly(res.equity["equity"], cfg.portfolio.monthly_target)
     path = report.write(res, args.out, title, close, cfg.portfolio.monthly_target)
     print(f"\nОтчет: {path}  (equity.csv, trades.csv, summary.json рядом)")
@@ -128,6 +148,10 @@ def cmd_ctl(args) -> None:
         print(f"Нет состояния {state} — бот в этом режиме еще не запускался.")
         return
     st = json.loads(state.read_text())
+    if st.get("snapshot"):
+        from . import messages
+        print(re.sub(r"<[^>]+>", "", messages.report_text(st["snapshot"], "Состояние")))
+        return
     print(f"Режим: {cfg.exchange.mode}  биржа: {cfg.exchange.name}  профиль: {cfg.portfolio.profile}")
     print(f"Сохранено: {st.get('saved_at')}   последний бар: {st.get('last_bar')}")
     g = st["decider"]["guard"]
@@ -147,6 +171,33 @@ def cmd_ctl(args) -> None:
             print(f"  {s}: {u:.6f}  стоп {stop:.4f}")
     if not any(u > 0 for u in st["book"]["units"].values()):
         print("  нет (всё в USDT)")
+
+
+def cmd_tg_setup(args) -> None:
+    """Проверка Telegram: показывает chat_id тех, кто писал боту, и шлёт тестовое сообщение."""
+    from .telegram import Telegram
+
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise SystemExit("Сначала задайте TELEGRAM_BOT_TOKEN в .env (токен выдаёт @BotFather).")
+    chat = os.getenv("TELEGRAM_CHAT_ID")
+    tg = Telegram(token, chat)
+    seen = {}
+    for u in tg.updates(timeout=0):
+        c = (u.get("message") or {}).get("chat") or {}
+        if c.get("id"):
+            seen[c["id"]] = c.get("username") or c.get("title") or c.get("first_name") or ""
+    if seen:
+        print("Чаты, из которых писали боту:")
+        for cid, name in seen.items():
+            print(f"  TELEGRAM_CHAT_ID={cid}   ({name})")
+    elif not chat:
+        print("Боту ещё никто не писал. Откройте бота в Telegram, отправьте /start и повторите.")
+    if chat:
+        ok = tg.send("✅ Связь есть. Бот будет присылать сюда сигналы и отчёты.")
+        print(f"Тестовое сообщение в чат {chat}: {'отправлено' if ok else 'ОШИБКА (см. выше)'}")
+    else:
+        print("Впишите нужный TELEGRAM_CHAT_ID в .env и запустите команду ещё раз.")
 
 
 def cmd_logs(args) -> None:
@@ -195,11 +246,15 @@ def main(argv=None) -> None:
     c.add_argument("--mode", choices=["paper", "testnet", "live"])
     c.set_defaults(func=cmd_ctl)
 
+    tg = sub.add_parser("tg-setup", help="узнать chat_id и проверить Telegram")
+    tg.set_defaults(func=cmd_tg_setup)
+
     lg = sub.add_parser("logs", help="последние строки лога")
     lg.add_argument("-n", type=int, default=40)
     lg.set_defaults(func=cmd_logs)
 
     args = p.parse_args(argv)
+    _load_env()
     args.func(args)
 
 

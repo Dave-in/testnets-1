@@ -15,6 +15,7 @@ log = logging.getLogger(__name__)
 class Book:
     cash: float
     units: dict[str, float] = field(default_factory=dict)
+    cost: dict[str, float] = field(default_factory=dict)  # сколько USDT вложено в текущую позицию
 
     def equity(self, prices: dict[str, float]) -> float:
         return self.cash + sum(u * prices[s] for s, u in self.units.items() if u > 0)
