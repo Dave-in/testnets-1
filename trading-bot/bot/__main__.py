@@ -173,8 +173,20 @@ def cmd_ctl(args) -> None:
         print("  нет (всё в USDT)")
 
 
+def _save_env_value(key: str, value: str, path: str = ".env") -> None:
+    p = Path(path)
+    lines = p.read_text(encoding="utf-8").splitlines() if p.exists() else []
+    lines = [ln for ln in lines if not ln.strip().startswith(f"{key}=")] + [f"{key}={value}"]
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    p.chmod(0o600)
+
+
 def cmd_tg_setup(args) -> None:
-    """Проверка Telegram: показывает chat_id тех, кто писал боту, и шлёт тестовое сообщение."""
+    """Проверка Telegram: находит chat_id того, кто написал боту, и шлёт тестовое сообщение.
+
+    С --wait N ждёт первое сообщение до N секунд и сам записывает TELEGRAM_CHAT_ID в .env."""
+    import time
+
     from .telegram import Telegram
 
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -182,22 +194,35 @@ def cmd_tg_setup(args) -> None:
         raise SystemExit("Сначала задайте TELEGRAM_BOT_TOKEN в .env (токен выдаёт @BotFather).")
     chat = os.getenv("TELEGRAM_CHAT_ID")
     tg = Telegram(token, chat)
-    seen = {}
-    for u in tg.updates(timeout=0):
-        c = (u.get("message") or {}).get("chat") or {}
-        if c.get("id"):
-            seen[c["id"]] = c.get("username") or c.get("title") or c.get("first_name") or ""
-    if seen:
-        print("Чаты, из которых писали боту:")
-        for cid, name in seen.items():
-            print(f"  TELEGRAM_CHAT_ID={cid}   ({name})")
-    elif not chat:
-        print("Боту ещё никто не писал. Откройте бота в Telegram, отправьте /start и повторите.")
-    if chat:
-        ok = tg.send("✅ Связь есть. Бот будет присылать сюда сигналы и отчёты.")
-        print(f"Тестовое сообщение в чат {chat}: {'отправлено' if ok else 'ОШИБКА (см. выше)'}")
-    else:
-        print("Впишите нужный TELEGRAM_CHAT_ID в .env и запустите команду ещё раз.")
+    me = tg.call("getMe", {})
+    if not me.get("ok"):
+        raise SystemExit(f"Telegram не принял токен: {me.get('description')}")
+    name = me["result"].get("username")
+    print(f"Токен рабочий, бот: @{name}")
+
+    if not chat:
+        if args.wait:
+            print(f"Откройте https://t.me/{name} и отправьте боту /start — жду до {args.wait} с…")
+        deadline = time.time() + args.wait
+        seen: dict = {}
+        while not seen:
+            for u in tg.updates(timeout=min(25, max(0, int(deadline - time.time())))):
+                c = (u.get("message") or {}).get("chat") or {}
+                if c.get("id"):
+                    seen[c["id"]] = c.get("username") or c.get("title") or c.get("first_name") or ""
+            if time.time() >= deadline:
+                break
+        if not seen:
+            raise SystemExit("Боту никто не написал. Отправьте ему /start и повторите команду.")
+        chat = str(next(iter(seen)))
+        print(f"Найден чат: {chat} ({seen[int(chat)]})")
+        _save_env_value("TELEGRAM_CHAT_ID", chat)
+        print("TELEGRAM_CHAT_ID записан в .env")
+        tg.chat_id = chat
+    ok = tg.send("✅ Связь есть. Бот будет присылать сюда сигналы и отчёты.")
+    print(f"Тестовое сообщение в чат {chat}: {'отправлено' if ok else 'ОШИБКА (см. выше)'}")
+    if not ok:
+        raise SystemExit(1)
 
 
 def cmd_logs(args) -> None:
@@ -247,6 +272,7 @@ def main(argv=None) -> None:
     c.set_defaults(func=cmd_ctl)
 
     tg = sub.add_parser("tg-setup", help="узнать chat_id и проверить Telegram")
+    tg.add_argument("--wait", type=int, default=0, help="сколько секунд ждать /start от вас")
     tg.set_defaults(func=cmd_tg_setup)
 
     lg = sub.add_parser("logs", help="последние строки лога")

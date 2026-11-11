@@ -1,7 +1,10 @@
 """Загрузка конфига (TOML) в типизированные dataclass'ы."""
 from __future__ import annotations
 
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10: пакет tomli с тем же интерфейсом
+    import tomli as tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 

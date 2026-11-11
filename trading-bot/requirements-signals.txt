@@ -1,0 +1,5 @@
+# Минимум для сигнального бота на Binance (paper + Telegram). ccxt не нужен.
+pandas>=2.2
+numpy>=1.24
+requests>=2.28
+tomli>=2.0; python_version < "3.11"

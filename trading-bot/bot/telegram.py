@@ -55,7 +55,10 @@ class Telegram:
     def updates(self, timeout: int = 25) -> list[dict]:
         res = self.call("getUpdates", {"offset": self.offset, "timeout": timeout,
                                        "allowed_updates": ["message"]}, timeout=timeout + 10)
-        items = res.get("result", []) if res.get("ok") else []
+        if not res.get("ok"):
+            # например 409 Conflict: этим же токеном уже читает команды другой запущенный бот
+            raise RuntimeError(f"getUpdates: {res.get('description') or res}")
+        items = res.get("result", [])
         if items:
             self.offset = items[-1]["update_id"] + 1
         return items
