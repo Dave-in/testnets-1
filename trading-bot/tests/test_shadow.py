@@ -400,3 +400,33 @@ def test_engine_fast_forwards_long_gaps(tmp_path):
     eng.advance(T0)
     eng.advance(T0 + 30 * 86400 * 1000)                  # месяц без данных — не зависаем
     assert eng.now == T0 + 30 * 86400 * 1000
+
+
+def test_shadow_warns_once_when_bybit_is_blocked(tmp_path, monkeypatch):
+    import bot.shadow.bybit as bybit
+    from bot.group import start_shadow
+    from bot.telegram import Telegram
+
+    calls = []
+
+    def blocked(engine, stop=None):
+        calls.append(1)
+        raise RuntimeError("403 Client Error: Forbidden")
+    monkeypatch.setattr(bybit, "run_live", blocked)
+    import threading
+    import types
+
+    import bot.group as group
+    hold = threading.Event()
+    fake_time = types.SimpleNamespace(sleep=lambda s: None if len(calls) < 3 else hold.wait())
+    monkeypatch.setattr(group, "time", fake_time)          # без минутных пауз между попытками
+    sent = []
+    tg = Telegram("T", 111, lambda m, p, t: sent.append(p["text"]) or {"ok": True})
+    start_shadow({"bots": ["fade"]}, tmp_path, tg)
+    import time as _t
+    for _ in range(100):
+        if len(calls) >= 3:
+            break
+        _t.sleep(0.02)
+    warnings = [x for x in sent if "не могут получить данные Bybit" in x]
+    assert len(calls) >= 3 and len(warnings) == 1 and "Сингапуре" in warnings[0]

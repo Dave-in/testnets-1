@@ -175,12 +175,22 @@ def start_shadow(cfg: dict, state_dir: Path, tg=None) -> dict:
             bot.notifier.label = f"Тень · {bot.title}"
 
     def worker():
+        warned = False
         while True:                             # при сбое (биржа недоступна и т.п.) — перезапуск
             try:
                 run_live(engine)
                 return
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
                 log.exception("Теневые боты: сбой, перезапуск через 60 с")
+                if tg is not None and not warned:
+                    blocked = "403" in str(e) or "451" in str(e)
+                    tg.send("⚠️ Теневые боты не могут получить данные Bybit: "
+                            f"{messages.escape(str(e))[:200]}\n"
+                            + ("Похоже, Bybit закрыт для страны, где стоит сервер (например, США). "
+                               "Нужен VPS в другом регионе, например в Сингапуре. "
+                               if blocked else "")
+                            + "Остальные счета работают; повторяю попытки раз в минуту.")
+                    warned = True
                 time.sleep(60)
 
     threading.Thread(target=worker, daemon=True, name="shadow-bots").start()
