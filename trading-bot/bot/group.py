@@ -25,6 +25,16 @@ class BotSpec:
     signals: bool = True
 
 
+def load_shadow(path: str | Path) -> dict | None:
+    """Раздел [shadow] в bots.toml: теневые боты на стакане Bybit (None — выключены)."""
+    with open(path, "rb") as f:
+        sh = tomllib.load(f).get("shadow", {})
+    if not sh.get("enabled", False):
+        return None
+    with open(Path(path).parent / sh.get("config", "config.shadow.toml"), "rb") as f:
+        return tomllib.load(f)
+
+
 def load_group(path: str | Path) -> list[BotSpec]:
     with open(path, "rb") as f:
         raw = tomllib.load(f)
@@ -47,8 +57,10 @@ class Labeled:
 
 
 class Group:
-    def __init__(self, runners: dict[str, Runner], tg=None, poll_seconds: int = 60):
+    def __init__(self, runners: dict[str, Runner], tg=None, poll_seconds: int = 60,
+                 extra: dict | None = None):
         self.runners = runners
+        self.extra = extra or {}   # счета, которые работают сами (теневые боты): только отчёты
         self.tg = tg
         self.poll_seconds = poll_seconds
         self.errors = {name: 0 for name in runners}
@@ -76,15 +88,16 @@ class Group:
 
     def maybe_report(self) -> None:
         """Общий отчёт за день — когда все счета перешли на новые сутки (или ждём слишком долго)."""
-        rolled = [n for n, r in self.runners.items() if r.day_snapshot]
+        accounts = {**self.runners, **self.extra}
+        rolled = [n for n, r in accounts.items() if r.day_snapshot]
         if not rolled:
             return
         self.report_wait += 1
-        if len(rolled) < len(self.runners) and self.report_wait < 15:
+        if len(rolled) < len(accounts) and self.report_wait < 15:
             return
-        items = [(n, r.day_snapshot or r.snapshot) for n, r in self.runners.items()]
+        items = [(n, r.day_snapshot or r.snapshot) for n, r in accounts.items()]
         self._send(messages.group_report([(n, s) for n, s in items if s], "Отчёт за день"))
-        for r in self.runners.values():
+        for r in accounts.values():
             r.day_snapshot = None
         self.report_wait = 0
 
@@ -126,14 +139,49 @@ def build_group(path: str | Path, confirm_live: bool = False) -> Group:
         notifier = Labeled(tg, spec.name) if tg is not None and spec.signals else None
         runners[spec.name] = Runner(cfg, market, broker, state_path_for(cfg), notifier)
 
+    extra = {}
+    shadow_cfg = load_shadow(path)
+    if shadow_cfg is not None:
+        extra = start_shadow(shadow_cfg, base / "state", tg)
+
     if tg is not None:
         bots = [(n, r.state_path, control_path(r.state_path)) for n, r in runners.items()]
+        bots += [(n, b.state_path, b.control_path) for n, b in extra.items()]
         CommandListener(Telegram(token, chat), bots=bots).start()
         lines = [f"• <b>{messages.escape(s.name)}</b>: {cfgs[s.name].exchange.market}, "
                  f"монет {len(cfgs[s.name].portfolio.symbols)}, "
                  f"{'сигналы включены' if s.signals else 'без сигналов, только в отчётах'}"
                  for s in specs]
-        tg.send("🤖 Бот запущен, виртуальных счетов: " + str(len(specs)) + "\n"
+        if extra:
+            lines.append(f"• <b>Теневые боты</b> ({len(extra)}): фьючерсы Bybit, исполнение по "
+                         f"реальному стакану — " + ", ".join(messages.escape(n) for n in extra))
+        tg.send("🤖 Бот запущен, виртуальных счетов: " + str(len(specs) + len(extra)) + "\n"
                 + "\n".join(lines) + "\n/help — команды.")
     poll = min(c.live.poll_seconds for c in cfgs.values())
-    return Group(runners, tg, poll)
+    return Group(runners, tg, poll, extra)
+
+
+def start_shadow(cfg: dict, state_dir: Path, tg=None) -> dict:
+    """Запустить теневых ботов в отдельном потоке. Возвращает {подпись: бот} для отчётов."""
+    import threading
+
+    from .shadow.bybit import run_live
+    from .shadow.engine import Engine
+
+    engine = Engine(cfg, state_dir,
+                    notifier_for=(lambda k: Labeled(tg, f"Тень · {k}")) if tg is not None else None)
+    for bot in engine.bots.values():            # подписи в сообщениях — названиями стратегий
+        if bot.notifier is not None:
+            bot.notifier.label = f"Тень · {bot.title}"
+
+    def worker():
+        while True:                             # при сбое (биржа недоступна и т.п.) — перезапуск
+            try:
+                run_live(engine)
+                return
+            except Exception:  # noqa: BLE001
+                log.exception("Теневые боты: сбой, перезапуск через 60 с")
+                time.sleep(60)
+
+    threading.Thread(target=worker, daemon=True, name="shadow-bots").start()
+    return {f"Тень · {b.title}": b for b in engine.bots.values()}

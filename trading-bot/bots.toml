@@ -23,3 +23,10 @@ signals = false
 name = "Турбо"                 # агрессивный режим попыток: 50 USDT → цель x10, плечо до x5
 config = "config.turbo.toml"
 signals = true
+
+# Шесть теневых ботов: фьючерсы Bybit, виртуальные деньги, исполнение по реальному стакану.
+# Стратегии и настройки — в config.shadow.toml. Нужен доступ к api.bybit.com и stream.bybit.com
+# (из некоторых стран Bybit закрыт — тогда бот пишет в лог и пробует снова раз в минуту).
+[shadow]
+enabled = true
+config = "config.shadow.toml"

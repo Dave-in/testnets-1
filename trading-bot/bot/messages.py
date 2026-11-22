@@ -235,3 +235,20 @@ def group_report(items: list[tuple[str, dict]], title: str = "Отчёт") -> st
                     f"{pct(s['day_ret'])} · {pct(s['drawdown'], sign=False)}")
     blocks = [report_text(s, name) for name, s in items]
     return "\n".join(head) + "\n\n" + "\n\n".join(blocks)
+
+
+def shadow_trade(ev) -> str:
+    """Сделка теневого бота (виртуальные деньги, исполнение по реальному стакану)."""
+    side = "ЛОНГ" if ev.side > 0 else "ШОРТ"
+    if ev.action == "open":
+        return "\n".join([f"{'🟢' if ev.side > 0 else '🔴'} <b>ОТКРЫТЬ {side} {escape(ev.symbol)}</b>",
+                          f"Цена: {price(ev.price)} (проскальзывание {ev.slippage_bps:+.1f} б.п.)",
+                          f"Сумма: {money(ev.price * ev.qty)} USDT",
+                          f"Причина: {escape(ev.reason)}"])
+    why = {"tp": "тейк", "sl": "стоп", "time": "время вышло", "manual": "команда",
+           "liquidation": "ликвидация"}.get(ev.reason, ev.reason)
+    icon = "✅" if (ev.pnl or 0) >= 0 else "❌"
+    return "\n".join([f"⚪️ <b>ЗАКРЫТЬ {side} {escape(ev.symbol)}</b> — {why}",
+                      f"Цена: {price(ev.price)}",
+                      f"{icon} Итог сделки: {signed(ev.pnl or 0.0)} USDT "
+                      f"({pct(ev.ret or 0.0)} к сумме позиции, с комиссиями)"])

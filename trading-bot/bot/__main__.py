@@ -157,6 +157,57 @@ def cmd_run_all(args) -> None:
     build_group(args.group, confirm_live=args.confirm_live).run(once=args.once)
 
 
+def _shadow_cfg(path: str) -> dict:
+    from .config import tomllib
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def cmd_shadow(args) -> None:
+    """Шесть теневых ботов на живом потоке Bybit (без Telegram-команд; вместе со всеми — run-all)."""
+    from .shadow.bybit import run_live
+    from .shadow.engine import Engine
+
+    Path("logs").mkdir(exist_ok=True)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+                        handlers=[logging.StreamHandler(),
+                                  logging.FileHandler("logs/shadow.log", encoding="utf-8")])
+    cfg = _shadow_cfg(args.shadow_config)
+    tg = None
+    if os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"):
+        from .group import Labeled
+        from .telegram import Telegram
+        tg = Telegram(os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"])
+    engine = Engine(cfg, args.state_dir,
+                    notifier_for=(lambda k: Labeled(tg, "Тень: " + k)) if tg else None)
+    run_live(engine)
+
+
+def cmd_shadow_replay(args) -> None:
+    """Прогон шести ботов по истории Binance (тиковые сделки + глубина стакана)."""
+    import math
+
+    from .shadow.replay import run_replay
+
+    cfg = _shadow_cfg(args.shadow_config)
+    funding = {}
+    for s in args.symbols:
+        f = data.funding_path(args.data_dir, s.replace("USDT", "/USDT"))
+        if f.exists():
+            funding.update(data.load_funding(args.data_dir, [s.replace("USDT", "/USDT")]))
+    funding = {k.replace("/", ""): v for k, v in funding.items()}
+    engine = run_replay(cfg, args.symbols, args.days, Path(args.cache), Path(args.state_dir),
+                        funding=funding)
+    print(f"\n{'Бот':<20}{'сделок':>8}{'прибыльных':>12}{'итог USDT':>11}{'комиссии':>10}"
+          f"{'фандинг':>9}{'проскальз. б.п.':>17}")
+    for r in engine.summary():
+        wr = "—" if math.isnan(r["win_rate"]) else f"{r['win_rate'] * 100:.0f}%"
+        sl = "—" if math.isnan(r["avg_slippage_bps"]) else f"{r['avg_slippage_bps']:.1f}"
+        print(f"{r['bot']:<20}{r['trades']:>8}{wr:>12}{r['net']:>+11.2f}{r['fees']:>10.2f}"
+              f"{-r['funding']:>+9.2f}{sl:>17}")
+    print(f"\nЖурналы сделок: {args.state_dir}/shadow_*_trades.csv")
+
+
 def cmd_ctl(args) -> None:
     """Управление запущенным ботом и просмотр состояния."""
     import json
@@ -300,6 +351,20 @@ def main(argv=None) -> None:
     ra.add_argument("--once", action="store_true", help="один шаг и выход")
     ra.add_argument("--confirm-live", action="store_true")
     ra.set_defaults(func=cmd_run_all)
+
+    sh = sub.add_parser("shadow", help="6 теневых ботов на живом стакане Bybit")
+    sh.add_argument("--shadow-config", default="config.shadow.toml")
+    sh.add_argument("--state-dir", default="state")
+    sh.set_defaults(func=cmd_shadow)
+
+    sr = sub.add_parser("shadow-replay", help="6 теневых ботов на истории Binance")
+    sr.add_argument("--shadow-config", default="config.shadow.toml")
+    sr.add_argument("--symbols", nargs="+", default=["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT",
+                                                     "DOGEUSDT", "LINKUSDT"])
+    sr.add_argument("--days", nargs="+", required=True, help="даты YYYY-MM-DD")
+    sr.add_argument("--cache", default="data/replay")
+    sr.add_argument("--state-dir", default="state/replay")
+    sr.set_defaults(func=cmd_shadow_replay)
 
     c = sub.add_parser("ctl", help="управление: status | pause | resume | close-all | stop")
     c.add_argument("action", choices=["status", "pause", "resume", "close-all", "stop"])

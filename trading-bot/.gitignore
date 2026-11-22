@@ -8,3 +8,4 @@ reports/*
 !data/.gitkeep
 state/
 logs/
+data/replay/

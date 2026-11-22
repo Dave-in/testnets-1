@@ -1,0 +1,249 @@
+"""Виртуальный фьючерсный счёт и исполнение ордеров по реальному стакану.
+
+Правила исполнения (осторожные — лучше недооценить результат, чем переоценить):
+  * рыночный ордер исполняется через latency мс после сигнала проходом по уровням стакана;
+  * лимитный ордер встаёт в конец очереди: исполнится, только когда по его цене пройдёт
+    больше сделок, чем стояло впереди, плюс его собственный объём, или цена пройдёт насквозь;
+  * стоп срабатывает по цене сделок и дальше исполняется как рыночный — с проскальзыванием;
+  * комиссии Bybit по умолчанию: мейкер 0.02%, тейкер 0.055%; фандинг — по ставке биржи.
+"""
+from __future__ import annotations
+
+import itertools
+from dataclasses import asdict, dataclass, field
+
+_ids = itertools.count(1)
+
+
+@dataclass
+class Order:
+    symbol: str
+    side: str              # buy | sell
+    kind: str              # market | limit | stop
+    qty: float
+    price: float = 0.0     # цена лимитки или триггер стопа
+    purpose: str = "entry"  # entry | tp | sl | time | manual
+    created: int = 0
+    exec_after: int = 0    # для рыночных: когда исполнять (задержка)
+    expire: int = 0        # для лимитных входов: когда снять
+    queue_ahead: float = 0.0
+    meta: dict = field(default_factory=dict)
+    id: int = field(default_factory=lambda: next(_ids))
+
+
+@dataclass
+class Position:
+    symbol: str
+    side: int              # +1 лонг, −1 шорт
+    qty: float
+    entry: float
+    opened: int
+    sl: float = 0.0
+    tp: float = 0.0
+    time_stop: int = 0
+    trail: float = 0.0     # расстояние трейлинг-стопа (0 — нет)
+    best: float = 0.0
+    fees: float = 0.0
+    funding: float = 0.0
+    reason: str = ""
+    slippage_bps: float = 0.0
+    funding_paid_for: int = 0
+
+
+@dataclass
+class FillReport:
+    """Что произошло — для журнала и уведомлений."""
+    symbol: str
+    action: str            # open | close
+    side: int
+    qty: float
+    price: float
+    fee: float
+    reason: str
+    slippage_bps: float = 0.0
+    pnl: float | None = None
+    ret: float | None = None
+
+
+class Account:
+    def __init__(self, name: str, capital: float, fees=(0.0002, 0.00055), latency_ms: int = 250):
+        self.name = name
+        self.start = capital
+        self.cash = capital
+        self.maker_fee, self.taker_fee = fees
+        self.latency = latency_ms
+        self.positions: dict[str, Position] = {}
+        self.orders: list[Order] = []
+        self.stats = {"closed": 0, "wins": 0, "realized": 0.0, "fees": 0.0, "funding": 0.0,
+                      "slippage_bps": 0.0, "opened": 0}
+        self.peak = capital
+        self.cooldown: dict[str, int] = {}
+        self.events: list[FillReport] = []      # движок забирает и рассылает
+
+    # --- оценка ----------------------------------------------------------------------
+    def equity(self, prices: dict[str, float]) -> float:
+        return self.cash + sum(p.side * p.qty * (prices.get(s, p.entry) - p.entry)
+                               for s, p in self.positions.items())
+
+    def gross(self, prices: dict[str, float]) -> float:
+        return sum(p.qty * prices.get(s, p.entry) for s, p in self.positions.items())
+
+    def busy(self, symbol: str, now: int) -> bool:
+        return (symbol in self.positions or self.cooldown.get(symbol, 0) > now
+                or any(o.symbol == symbol and o.purpose == "entry" for o in self.orders))
+
+    # --- ордера ---------------------------------------------------------------------
+    def submit(self, order: Order, book, now: int) -> Order:
+        order.created = now
+        if order.kind == "market":
+            order.exec_after = now + self.latency
+        elif order.kind == "limit":
+            # встаём в конец очереди на этом уровне
+            order.queue_ahead = book.size_at("bid" if order.side == "buy" else "ask", order.price)
+        self.orders.append(order)
+        return order
+
+    def cancel(self, symbol: str, purposes: tuple[str, ...]) -> None:
+        self.orders = [o for o in self.orders if not (o.symbol == symbol and o.purpose in purposes)]
+
+    def on_trade(self, symbol: str, price: float, qty: float, taker_buy: bool, book, now: int) -> None:
+        """Лента сделок: продвигаем очередь лимиток и проверяем стопы."""
+        for o in list(self.orders):
+            if o.symbol != symbol or o not in self.orders:
+                continue
+            if o.kind == "limit":
+                # нашу покупку исполняют продавцы-тейкеры, нашу продажу — покупатели
+                if (o.side == "buy" and taker_buy) or (o.side == "sell" and not taker_buy):
+                    continue
+                through = price < o.price if o.side == "buy" else price > o.price
+                if price == o.price:
+                    o.queue_ahead -= qty
+                if through or o.queue_ahead <= -o.qty:
+                    self.orders.remove(o)
+                    self._fill(o, o.price, o.qty, maker=True, now=now, mid=book.mid(), book=book)
+            elif o.kind == "stop":
+                hit = price <= o.price if o.side == "sell" else price >= o.price
+                if hit:
+                    o.kind, o.exec_after = "market", now + self.latency
+
+    def process(self, books: dict, now: int) -> None:
+        """Исполнить рыночные ордера, у которых прошла задержка; снять просроченные лимитки."""
+        for o in list(self.orders):
+            if o not in self.orders:
+                continue
+            if o.kind == "market" and now >= o.exec_after:
+                book = books[o.symbol]
+                avg, filled = book.walk(o.side, o.qty)
+                if filled <= 0:
+                    continue                      # стакан пуст — ждём следующего шага
+                self.orders.remove(o)
+                self._fill(o, avg, filled, maker=False, now=now, mid=o.meta.get("mid0", book.mid()),
+                           book=book)
+            elif o.kind == "limit" and o.expire and now >= o.expire:
+                self.orders.remove(o)
+
+    # --- исполнение ------------------------------------------------------------------
+    def _fill(self, o: Order, price: float, qty: float, maker: bool, now: int, mid: float,
+              book=None) -> None:
+        fee = price * qty * (self.maker_fee if maker else self.taker_fee)
+        sign = 1 if o.side == "buy" else -1
+        slip = sign * (price / mid - 1) * 1e4 if mid else 0.0   # + — хуже ожидаемого
+        self.cash -= fee
+        self.stats["fees"] += fee
+        pos = self.positions.get(o.symbol)
+        if o.purpose == "entry":
+            if pos is not None:
+                return
+            m = o.meta
+            pos = Position(o.symbol, sign, qty, price, now, reason=m.get("reason", ""),
+                           time_stop=now + int(m.get("time_stop_s", 0) * 1000) if m.get("time_stop_s") else 0,
+                           trail=m.get("trail", 0.0), best=price, fees=fee, slippage_bps=slip)
+            if m.get("sl_dist"):
+                pos.sl = price - sign * m["sl_dist"]
+                self.orders.append(Order(o.symbol, "sell" if sign > 0 else "buy", "stop", qty,
+                                         pos.sl, "sl", now))
+            if m.get("tp_dist"):
+                pos.tp = price + sign * m["tp_dist"]
+                tp = Order(o.symbol, "sell" if sign > 0 else "buy", "limit", qty, pos.tp, "tp", now)
+                if book is not None:   # очередь на уровне тейка — что там стоит сейчас
+                    tp.queue_ahead = book.size_at("ask" if sign > 0 else "bid", pos.tp)
+                self.orders.append(tp)
+            self.positions[o.symbol] = pos
+            self.stats["opened"] += 1
+            self.stats["slippage_bps"] += slip
+            self.events.append(FillReport(o.symbol, "open", sign, qty, price, fee, pos.reason, slip))
+            return
+        if pos is None:
+            return
+        pnl_gross = pos.side * (price - pos.entry) * qty
+        self.cash += pnl_gross
+        pos.fees += fee
+        net = pnl_gross - pos.fees - pos.funding
+        self.stats["realized"] += net
+        self.stats["closed"] += 1
+        self.stats["wins"] += net > 0
+        self.cancel(o.symbol, ("sl", "tp", "time"))
+        del self.positions[o.symbol]
+        self.cooldown[o.symbol] = now + 5 * 60 * 1000
+        self.events.append(FillReport(o.symbol, "close", pos.side, qty, price, fee, o.purpose,
+                                      slip, net, net / (pos.entry * pos.qty)))
+
+    def close(self, symbol: str, book, now: int, purpose: str) -> None:
+        pos = self.positions.get(symbol)
+        if pos is None or any(o.symbol == symbol and o.kind == "market" for o in self.orders):
+            return
+        self.cancel(symbol, ("sl", "tp", "time"))
+        self.orders.append(Order(symbol, "sell" if pos.side > 0 else "buy", "market", pos.qty,
+                                 purpose=purpose, created=now, exec_after=now + self.latency,
+                                 meta={"mid0": book.mid()}))
+
+    # --- раз в секунду ------------------------------------------------------------------
+    def check_liquidation(self, markets: dict, now: int, maintenance: float = 0.005) -> bool:
+        """Если капитал опустился до поддерживающей маржи — биржа закрыла бы всё."""
+        prices = {s: m.price() for s, m in markets.items()}
+        if self.positions and self.equity(prices) <= maintenance * self.gross(prices):
+            for s in list(self.positions):
+                self.close(s, markets[s].book, now, "liquidation")
+            return True
+        return False
+
+    def housekeeping(self, markets: dict, now: int) -> None:
+        for s, pos in list(self.positions.items()):
+            m = markets[s]
+            price = m.price()
+            if pos.time_stop and now >= pos.time_stop:
+                self.close(s, m.book, now, "time")
+                continue
+            if pos.trail:
+                pos.best = max(pos.best, price) if pos.side > 0 else min(pos.best, price)
+                new_sl = pos.best - pos.side * pos.trail
+                if (pos.side > 0 and new_sl > pos.sl) or (pos.side < 0 and (not pos.sl or new_sl < pos.sl)):
+                    pos.sl = new_sl
+                    for o in self.orders:
+                        if o.symbol == s and o.purpose == "sl":
+                            o.price = new_sl
+            # фандинг: начисляем один раз за каждую выплату
+            if m.next_funding and now >= m.next_funding and pos.funding_paid_for != m.next_funding:
+                if pos.opened < m.next_funding:
+                    pay = pos.side * pos.qty * (m.mark_price or price) * m.funding_rate
+                    self.cash -= pay
+                    pos.funding += pay
+                    self.stats["funding"] += pay
+                pos.funding_paid_for = m.next_funding
+
+    def to_dict(self) -> dict:
+        return {"cash": self.cash, "peak": self.peak, "stats": self.stats, "cooldown": self.cooldown,
+                "positions": {s: asdict(p) for s, p in self.positions.items()}}
+
+    def load_dict(self, d: dict) -> None:
+        self.cash = d.get("cash", self.cash)
+        self.peak = d.get("peak", self.peak)
+        self.stats.update(d.get("stats", {}))
+        self.cooldown = {k: int(v) for k, v in d.get("cooldown", {}).items()}
+        self.positions = {s: Position(**p) for s, p in d.get("positions", {}).items()}
+        for s, p in self.positions.items():   # восстановить защитные ордера
+            close_side = "sell" if p.side > 0 else "buy"
+            if p.sl:
+                self.orders.append(Order(s, close_side, "stop", p.qty, p.sl, "sl"))
+            if p.tp:
+                self.orders.append(Order(s, close_side, "limit", p.qty, p.tp, "tp"))
