@@ -48,6 +48,8 @@ class Position:
     reason: str = ""
     slippage_bps: float = 0.0
     funding_paid_for: int = 0
+    realized: float = 0.0      # результат уже закрытых частей позиции (до комиссий)
+    closed_qty: float = 0.0
 
 
 @dataclass
@@ -87,6 +89,14 @@ class Account:
 
     def gross(self, prices: dict[str, float]) -> float:
         return sum(p.qty * prices.get(s, p.entry) for s, p in self.positions.items())
+
+    def pending_entries(self) -> list[Order]:
+        return [o for o in self.orders if o.purpose == "entry"]
+
+    def committed(self, prices: dict[str, float]) -> float:
+        """Объём открытых позиций плюс ордеров на вход, которые ещё могут исполниться."""
+        return self.gross(prices) + sum(o.qty * (o.price or prices.get(o.symbol, 0.0))
+                                        for o in self.pending_entries())
 
     def busy(self, symbol: str, now: int) -> bool:
         return (symbol in self.positions or self.cooldown.get(symbol, 0) > now
@@ -178,6 +188,20 @@ class Account:
         pnl_gross = pos.side * (price - pos.entry) * qty
         self.cash += pnl_gross
         pos.fees += fee
+        if qty < pos.qty * (1 - 1e-9):
+            # стакана не хватило: закрыта часть, остаток закрываем следующим рыночным ордером
+            pos.realized += pnl_gross
+            pos.closed_qty += qty
+            pos.qty -= qty
+            for other in self.orders:
+                if other.symbol == o.symbol and other.purpose in ("sl", "tp"):
+                    other.qty = pos.qty
+            if o.kind == "market":
+                self.orders.append(Order(o.symbol, o.side, "market", pos.qty, purpose=o.purpose,
+                                         created=now, exec_after=now + self.latency, meta=o.meta))
+            return
+        pnl_gross += pos.realized
+        qty += pos.closed_qty
         net = pnl_gross - pos.fees - pos.funding
         self.stats["realized"] += net
         self.stats["closed"] += 1
@@ -186,7 +210,7 @@ class Account:
         del self.positions[o.symbol]
         self.cooldown[o.symbol] = now + 5 * 60 * 1000
         self.events.append(FillReport(o.symbol, "close", pos.side, qty, price, fee, o.purpose,
-                                      slip, net, net / (pos.entry * pos.qty)))
+                                      slip, net, net / (pos.entry * qty)))
 
     def close(self, symbol: str, book, now: int, purpose: str) -> None:
         pos = self.positions.get(symbol)
@@ -246,4 +270,7 @@ class Account:
             if p.sl:
                 self.orders.append(Order(s, close_side, "stop", p.qty, p.sl, "sl"))
             if p.tp:
-                self.orders.append(Order(s, close_side, "limit", p.qty, p.tp, "tp"))
+                # очередь на уровне тейка после перезапуска неизвестна: считаем, что мы в её
+                # конце — тейк исполнится, только если цена пройдёт уровень насквозь
+                self.orders.append(Order(s, close_side, "limit", p.qty, p.tp, "tp",
+                                         queue_ahead=float("inf")))

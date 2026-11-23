@@ -99,7 +99,7 @@ class CommandListener(threading.Thread):
         out = []
         for name, state, _ in self.bots:
             try:
-                snap = json.loads(state.read_text()).get("snapshot")
+                snap = json.loads(state.read_text(encoding="utf-8")).get("snapshot")
             except (OSError, ValueError):
                 snap = None
             if snap:

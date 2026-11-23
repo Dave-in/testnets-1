@@ -57,7 +57,7 @@ class ShadowBot:
 
     def _load(self) -> None:
         if self.state_path.exists():
-            st = json.loads(self.state_path.read_text())
+            st = json.loads(self.state_path.read_text(encoding="utf-8"))
             self.account.load_dict(st.get("account", {}))
             self.paused = st.get("paused", False)
             self.marks = st.get("marks", {})
@@ -67,7 +67,7 @@ class ShadowBot:
         tmp = self.state_path.with_suffix(".tmp")
         tmp.write_text(json.dumps({"account": self.account.to_dict(), "paused": self.paused,
                                    "marks": self.marks, "snapshot": self.snapshot},
-                                  ensure_ascii=False, default=str))
+                                  ensure_ascii=False, default=str), encoding="utf-8")
         tmp.replace(self.state_path)
 
 
@@ -138,7 +138,8 @@ class Engine:
                 self._notify(bot, "💥 Счёт достиг уровня ликвидации — все позиции закрываются.")
             if not bot.paused:
                 for sym, m in self.markets.items():
-                    if len(acc.positions) >= bot.max_positions:
+                    # ордера на вход, которые ещё не исполнились, тоже занимают место
+                    if len(acc.positions) + len(acc.pending_entries()) >= bot.max_positions:
                         break
                     if acc.busy(sym, now):
                         continue
@@ -169,7 +170,7 @@ class Engine:
         if sig.tp_dist and sig.tp_dist / price < bot.min_reward_cost * round_trip:
             return
         qty = bot.risk * equity / sl_dist                         # стоп = risk·капитала
-        room = bot.max_leverage * equity - acc.gross(prices)
+        room = bot.max_leverage * equity - acc.committed(prices)
         qty = min(qty, max(room, 0.0) / price, bot.max_position_leverage * equity / price)
         if qty * price < bot.min_notional:
             return
@@ -212,7 +213,7 @@ class Engine:
         if not bot.control_path.exists():
             return
         try:
-            cmd = json.loads(bot.control_path.read_text()).get("command")
+            cmd = json.loads(bot.control_path.read_text(encoding="utf-8")).get("command")
         except ValueError:
             cmd = None
         bot.control_path.unlink(missing_ok=True)

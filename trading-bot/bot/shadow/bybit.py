@@ -28,14 +28,34 @@ def _get(path: str, params: dict) -> dict:
     return data["result"]
 
 
+NON_CRYPTO = ["stock", "ETF", "commodity", "forex", "index"]   # поле symbolType у Bybit
+
+
+def book_depth_usd(symbol: str, pct: float) -> float:
+    """Объём стакана в $ в пределах pct % от середины — по более тонкой стороне."""
+    ob = _get("/v5/market/orderbook", {"category": "linear", "symbol": symbol, "limit": 200})
+    bids = [(float(p), float(q)) for p, q in ob.get("b", [])]
+    asks = [(float(p), float(q)) for p, q in ob.get("a", [])]
+    if not bids or not asks:
+        return 0.0
+    mid = (bids[0][0] + asks[0][0]) / 2
+    lo, hi = mid * (1 - pct / 100), mid * (1 + pct / 100)
+    return min(sum(p * q for p, q in bids if p >= lo), sum(p * q for p, q in asks if p <= hi))
+
+
 def select_universe(cfg: dict) -> list[str]:
-    """Монеты по ликвидности: оборот за сутки, возраст контракта, без исключённых."""
+    """Монеты по ликвидности: только криптовалюты (без токенизированных акций, ETF, золота),
+    оборот за сутки, возраст контракта, узкий спред и достаточная глубина стакана."""
     u = cfg.get("universe", {})
     if u.get("symbols"):
         return list(u["symbols"])
     min_turnover = float(u.get("min_turnover_usd", 30e6))
     min_age_ms = int(float(u.get("min_age_days", 60)) * 86400 * 1000)
     exclude = set(u.get("exclude", []))
+    exclude_types = {t.lower() for t in u.get("exclude_types", NON_CRYPTO)}
+    max_spread = float(u.get("max_spread_bps", 3.0)) / 1e4
+    depth_pct = float(u.get("depth_pct", 0.1))
+    min_depth = float(u.get("min_depth_usd", 6000.0))
     top = int(u.get("top", 20))
     instruments = {}
     cursor = ""
@@ -52,12 +72,27 @@ def select_universe(cfg: dict) -> list[str]:
         s, info = t["symbol"], instruments.get(t["symbol"], {})
         if (not s.endswith("USDT") or s in exclude or info.get("status") != "Trading"
                 or info.get("contractType") != "LinearPerpetual"
-                or now - int(info.get("launchTime", now)) < min_age_ms):
+                or now - int(info.get("launchTime", now)) < min_age_ms
+                or (info.get("symbolType") or "").lower() in exclude_types):
             continue
         turnover = float(t.get("turnover24h") or 0)
-        if turnover >= min_turnover:
+        bid, ask = float(t.get("bid1Price") or 0), float(t.get("ask1Price") or 0)
+        spread = (ask - bid) / ((ask + bid) / 2) if bid > 0 and ask > 0 else 1.0
+        if turnover >= min_turnover and spread <= max_spread:
             rows.append((turnover, s))
-    chosen = [s for _, s in sorted(rows, reverse=True)[:top]]
+    chosen = []
+    for _, s in sorted(rows, reverse=True):
+        if len(chosen) >= top:
+            break
+        try:
+            depth = book_depth_usd(s, depth_pct)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Стакан %s не получен: %s", s, e)
+            continue
+        if depth >= min_depth:
+            chosen.append(s)
+        else:
+            log.info("%s пропущена: в пределах %.2f%% всего %.0f $", s, depth_pct, depth)
     ref = cfg.get("lag", {}).get("ref", "BTCUSDT")
     if ref not in chosen:
         chosen.insert(0, ref)

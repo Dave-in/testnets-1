@@ -213,9 +213,9 @@ def test_engine_trades_journals_and_reports(tmp_path):
         eng.on_trade("ETHUSDT", t, p, 1.0, taker_buy=p < 104)
     bot = eng.bots["fade"]
     assert bot.account.stats["opened"] >= 1
-    rows = (tmp_path / "shadow_fade_trades.csv").read_text().splitlines()
+    rows = (tmp_path / "shadow_fade_trades.csv").read_text(encoding="utf-8").splitlines()
     assert rows[0].startswith("ts,symbol,action") and any(",open," in r for r in rows[1:])
-    snap = json.loads((tmp_path / "shadow_fade.json").read_text())["snapshot"]
+    snap = json.loads((tmp_path / "shadow_fade.json").read_text(encoding="utf-8"))["snapshot"]
     assert "Счёт:" in messages.status_text(snap) and snap["stats"]["closed"] >= 0
     assert "Сравнение счетов" in messages.group_report([("Тень", snap)])
 
@@ -430,3 +430,73 @@ def test_shadow_warns_once_when_bybit_is_blocked(tmp_path, monkeypatch):
         _t.sleep(0.02)
     warnings = [x for x in sent if "не могут получить данные Bybit" in x]
     assert len(calls) >= 3 and len(warnings) == 1 and "Сингапуре" in warnings[0]
+
+
+# --- исправления: лимит позиций, частичное закрытие, выбор монет -------------------------
+
+def test_pending_entries_count_towards_position_and_leverage_limits(tmp_path):
+    class Always(S.Strategy):
+        key, title, defaults = "fade", "x", {}
+
+        def check(self, m, now, markets):
+            return S.Signal(1, m.price() * 0.01, m.price() * 0.05)
+
+    e = Engine({"bots": ["fade"], "account": {"capital": 100.0, "max_positions": 3}}, tmp_path)
+    e.bots["fade"].strategy = Always()
+    for i in range(10):
+        e.add_market(f"C{i}USDT", book(100.0, size=1e6)).last_price = 100.0
+    for t in range(1, 5):
+        e.advance(T0 + t * 1000)
+    acc = e.bots["fade"].account
+    prices = {s: 100.0 for s in e.markets}
+    assert len(acc.positions) == 3
+    assert acc.gross(prices) <= 10 * acc.equity(prices) + 1e-9
+
+
+def test_partial_close_keeps_remainder_and_accounts_once():
+    ob = book(100.0, 0.1, 10.0, levels=50)
+    acc = Account("t", 1000.0)
+    acc.submit(Order("X", "buy", "market", 3.0, meta={"sl_dist": 1.0, "mid0": 100.0}), ob, T0)
+    acc.process({"X": ob}, T0 + 300)
+    thin = book(101.0, 0.1, 1.0, levels=1)                  # в стакане всего 1 монета на покупку
+    acc.close("X", thin, T0 + 1000, "manual")
+    acc.process({"X": thin}, T0 + 1300)
+    assert acc.positions["X"].qty == pytest.approx(2.0)      # закрыта треть, остаток жив
+    assert acc.stats["closed"] == 0
+    acc.process({"X": book(101.0, 0.1, 10.0)}, T0 + 1600)   # стакан восстановился
+    assert "X" not in acc.positions and acc.stats["closed"] == 1
+    assert acc.cash == pytest.approx(1000.0 + acc.stats["realized"])
+
+
+def test_restored_take_profit_fills_only_through_level():
+    acc = Account("t", 1000.0)
+    acc.load_dict({"positions": {"X": {"symbol": "X", "side": 1, "qty": 1.0, "entry": 100.0,
+                                       "opened": T0, "sl": 99.0, "tp": 101.0}}})
+    ob = book(101.0)
+    acc.on_trade("X", 101.0, 100.0, taker_buy=True, book=ob, now=T0 + 1)    # на уровне — мало
+    assert "X" in acc.positions
+    acc.on_trade("X", 101.1, 0.1, taker_buy=True, book=ob, now=T0 + 2)      # насквозь
+    assert "X" not in acc.positions
+
+
+def test_universe_skips_stocks_wide_spread_and_thin_books(monkeypatch):
+    from bot.shadow import bybit
+    old = "1600000000000"
+    inst = [{"symbol": s, "status": "Trading", "contractType": "LinearPerpetual",
+             "launchTime": old, "symbolType": t}
+            for s, t in [("BTCUSDT", ""), ("NVDAUSDT", "stock"), ("WIDEUSDT", ""),
+                         ("THINUSDT", ""), ("GOODUSDT", "")]]
+    tick = {"BTCUSDT": (100.0, 100.01), "NVDAUSDT": (100.0, 100.01), "WIDEUSDT": (100.0, 100.1),
+            "THINUSDT": (100.0, 100.01), "GOODUSDT": (100.0, 100.01)}
+
+    def fake_get(path, params):
+        if path.endswith("instruments-info"):
+            return {"list": inst}
+        if path.endswith("tickers"):
+            return {"list": [{"symbol": s, "turnover24h": "1e9", "bid1Price": b, "ask1Price": a}
+                             for s, (b, a) in tick.items()]}
+        size = 1.0 if params["symbol"] == "THINUSDT" else 1000.0
+        return {"b": [["100.0", size]], "a": [["100.01", size]]}
+
+    monkeypatch.setattr(bybit, "_get", fake_get)
+    assert sorted(bybit.select_universe({"universe": {}})) == ["BTCUSDT", "GOODUSDT"]

@@ -90,7 +90,7 @@ class Runner:
         if not self.state_path.exists():
             log.info("Новый запуск. Капитал бота: %.2f USDT", self.book.cash)
             return
-        st = json.loads(self.state_path.read_text())
+        st = json.loads(self.state_path.read_text(encoding="utf-8"))
         units = {s: st["book"]["units"].get(s, 0.0) for s in self.symbols}
         entry = {s: st["book"].get("entry", {}).get(s, 0.0) for s in self.symbols}
         for s, cost in st["book"].get("cost", {}).items():  # формат до появления шортов
@@ -129,7 +129,7 @@ class Runner:
             "last_bar": self.last_bar,
             "paused": self.paused,
             "saved_at": datetime.now(timezone.utc).isoformat(),
-        }, ensure_ascii=False, indent=2, default=str))
+        }, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         tmp.replace(self.state_path)
 
     def _journal(self, name: str, row: dict) -> None:
@@ -434,7 +434,7 @@ class Runner:
     def apply_control(self, prices: dict[str, float]) -> None:
         if not self.control_path.exists():
             return
-        data = json.loads(self.control_path.read_text())
+        data = json.loads(self.control_path.read_text(encoding="utf-8"))
         cmd, value = data.get("command"), data.get("value")
         self.control_path.unlink()
         log.warning("Команда управления: %s %s", cmd, value if value is not None else "")
