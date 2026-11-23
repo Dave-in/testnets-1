@@ -3,7 +3,7 @@
 # Запуск отдельно: python -m bot shadow   |   вместе с остальными ботами — см. bots.toml.
 
 bots = ["liq", "book", "lag", "oi", "fund", "fade"]
-notify_trades = false      # true — присылать в Telegram каждую сделку всех шести ботов (много)
+notify_trades = true       # каждая сделка — в тему бота в группе Telegram (группу привязывает /here)
 save_every_s = 60
 
 [universe]

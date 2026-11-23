@@ -23,6 +23,9 @@ HELP = (
     "\n<b>Режим попыток (Турбо)</b>\n"
     "/cashout — вывести сейчас: закрыть позиции, зафиксировать итог, начать новую попытку\n"
     "/target 3 — сменить цель попытки (здесь: x3)\n"
+    "\n<b>Теневые боты</b>\n"
+    "/here — отправить в группе с темами: бот создаст тему для каждого теневого бота и будет "
+    "писать туда все сделки. В группе работают /status и /report, управление — только здесь\n"
     "/help — эта справка"
 )
 
@@ -237,18 +240,31 @@ def group_report(items: list[tuple[str, dict]], title: str = "Отчёт") -> st
     return "\n".join(head) + "\n\n" + "\n\n".join(blocks)
 
 
-def shadow_trade(ev) -> str:
-    """Сделка теневого бота (виртуальные деньги, исполнение по реальному стакану)."""
+def shadow_trade(ev, title: str = "", summary: dict | None = None) -> str:
+    """Сделка теневого бота (виртуальные деньги, исполнение по реальному стакану).
+    title — название бота; summary — баланс и статистика счёта после сделки."""
     side = "ЛОНГ" if ev.side > 0 else "ШОРТ"
+    lines = [f"🤖 <b>{escape(title)}</b>"] if title else []
     if ev.action == "open":
-        return "\n".join([f"{'🟢' if ev.side > 0 else '🔴'} <b>ОТКРЫТЬ {side} {escape(ev.symbol)}</b>",
-                          f"Цена: {price(ev.price)} (проскальзывание {ev.slippage_bps:+.1f} б.п.)",
-                          f"Сумма: {money(ev.price * ev.qty)} USDT",
-                          f"Причина: {escape(ev.reason)}"])
-    why = {"tp": "тейк", "sl": "стоп", "time": "время вышло", "manual": "команда",
-           "liquidation": "ликвидация"}.get(ev.reason, ev.reason)
-    icon = "✅" if (ev.pnl or 0) >= 0 else "❌"
-    return "\n".join([f"⚪️ <b>ЗАКРЫТЬ {side} {escape(ev.symbol)}</b> — {why}",
-                      f"Цена: {price(ev.price)}",
-                      f"{icon} Итог сделки: {signed(ev.pnl or 0.0)} USDT "
-                      f"({pct(ev.ret or 0.0)} к сумме позиции, с комиссиями)"])
+        lines += [f"{'🟢' if ev.side > 0 else '🔴'} <b>ОТКРЫТЬ {side} {escape(ev.symbol)}</b>",
+                  f"Цена: {price(ev.price)} (проскальзывание {ev.slippage_bps:+.1f} б.п.)",
+                  f"Сумма: {money(ev.price * ev.qty)} USDT",
+                  f"Причина: {escape(ev.reason)}"]
+    else:
+        why = {"tp": "тейк", "sl": "стоп", "time": "время вышло", "manual": "команда",
+               "liquidation": "ликвидация"}.get(ev.reason, ev.reason)
+        icon = "✅" if (ev.pnl or 0) >= 0 else "❌"
+        lines += [f"⚪️ <b>ЗАКРЫТЬ {side} {escape(ev.symbol)}</b> — {why}",
+                  f"Цена: {price(ev.price)}",
+                  f"{icon} Итог сделки: {signed(ev.pnl or 0.0)} USDT "
+                  f"({pct(ev.ret or 0.0)} к сумме позиции, с комиссиями)"]
+    if summary:
+        s = summary
+        total = s["equity"] / s["start"] - 1 if s["start"] else 0.0
+        win = f"{s['wins'] / s['closed'] * 100:.0f}%" if s["closed"] else "—"
+        lines += ["",
+                  f"💼 Баланс: <b>{money(s['equity'])} USDT</b> ({pct(total)} от {money(s['start'])}) · "
+                  f"открыто позиций: {s['open']}",
+                  f"📊 Сделок: {s['closed']} · прибыльных {win} · итог {signed(s['realized'])} USDT · "
+                  f"комиссии {money(s['fees'])}"]
+    return "\n".join(lines)

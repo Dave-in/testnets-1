@@ -197,15 +197,27 @@ class Engine:
                 if new:
                     w.writeheader()
                 w.writerow(row)
-            if self.notify_trades:
-                self._notify(bot, messages.shadow_trade(ev))
+            if self.notify_trades and bot.notifier is not None:
+                self._notify(bot, messages.shadow_trade(ev, bot.title, self.account_summary(bot)),
+                             trade=True)
         bot.account.events.clear()
 
+    def account_summary(self, bot: ShadowBot) -> dict:
+        """Баланс и статистика счёта — для сообщения о сделке."""
+        acc, st = bot.account, bot.account.stats
+        prices = {s: m.price() for s, m in self.markets.items()}
+        return {"equity": acc.equity(prices), "start": acc.start, "open": len(acc.positions),
+                "closed": st["closed"], "wins": st["wins"], "realized": st["realized"],
+                "fees": st["fees"]}
+
     # --- управление и отчёты -------------------------------------------------------------
-    def _notify(self, bot: ShadowBot, text: str) -> None:
+    def _notify(self, bot: ShadowBot, text: str, trade: bool = False) -> None:
         if bot.notifier is not None:
             try:
-                bot.notifier.send(text)
+                if trade:
+                    bot.notifier.send(text, trade=True)
+                else:
+                    bot.notifier.send(text)
             except Exception:  # noqa: BLE001
                 log.exception("Не удалось отправить уведомление")
 

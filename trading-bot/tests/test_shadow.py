@@ -500,3 +500,119 @@ def test_universe_skips_stocks_wide_spread_and_thin_books(monkeypatch):
 
     monkeypatch.setattr(bybit, "_get", fake_get)
     assert sorted(bybit.select_universe({"universe": {}})) == ["BTCUSDT", "GOODUSDT"]
+
+
+# --- Telegram: группа с темами, сообщение о каждой сделке с балансом и статистикой --------
+
+class FakeTG:
+    """Подмена API Telegram: запоминает вызовы, темы получают номера 100, 101, …"""
+
+    def __init__(self):
+        self.calls, self.next_topic = [], 100
+
+    def __call__(self, method, payload, timeout):
+        self.calls.append((method, payload))
+        if method == "createForumTopic":
+            self.next_topic += 1
+            return {"ok": True, "result": {"message_thread_id": self.next_topic - 1}}
+        return {"ok": True, "result": {}}
+
+    def sent(self):
+        return [p for m, p in self.calls if m == "sendMessage"]
+
+
+def test_shadow_trade_message_has_bot_balance_and_stats():
+    from bot.shadow.sim import FillReport
+    ev = FillReport("ETHUSDT", "close", 1, 1.0, 101.0, 0.05, "tp", 0.0, 0.85, 0.0085)
+    text = messages.shadow_trade(ev, "Ликвидации", {"equity": 101.7, "start": 100.0, "open": 1,
+                                                    "closed": 4, "wins": 3, "realized": 1.9,
+                                                    "fees": 0.6})
+    assert "Ликвидации" in text and "ЗАКРЫТЬ ЛОНГ ETHUSDT" in text and "тейк" in text
+    assert "101.70 USDT" in text and "+1.70%" in text and "Сделок: 4" in text and "75%" in text
+
+
+def test_channel_binds_group_creates_topics_once_and_routes_by_topic(tmp_path):
+    from bot.telegram import ShadowChannel, Telegram, TopicNotifier
+    api = FakeTG()
+    tg = Telegram("T", 111, api)
+    ch = ShadowChannel(tg, tmp_path / "tg.json", start=False)
+    private = []
+    liq = TopicNotifier(ch, "Ликвидации", fallback=types_ns(send=lambda t: private.append(t) or True))
+    TopicNotifier(ch, "Стакан")
+    assert not liq.send("сделка", trade=True) and private == []     # группы нет — сделки молчат
+    assert liq.send("предупреждение") and private == ["предупреждение"]
+    assert "✅" in ch.bind("-1001")
+    assert ch.topics == {"Ликвидации": 100, "Стакан": 101}
+    ch.bind("-1001")                                                 # повторно — без дублей
+    assert sum(m == "createForumTopic" for m, _ in api.calls) == 2
+    assert liq.send("сделка", trade=True)
+    ch.send_one(*ch.queue.get_nowait())
+    last = api.sent()[-1]
+    assert last["chat_id"] == "-1001" and last["message_thread_id"] == 100
+    again = ShadowChannel(tg, tmp_path / "tg.json", start=False)    # после перезапуска
+    assert again.chat_id == "-1001" and again.topics["Стакан"] == 101
+
+
+def types_ns(**kw):
+    import types
+    return types.SimpleNamespace(**kw)
+
+
+def test_group_commands_only_owner_binds_and_only_read_commands(tmp_path):
+    from bot.telegram import CommandListener, ShadowChannel, Telegram
+    api = FakeTG()
+    tg = Telegram("T", 111, api)
+    ch = ShadowChannel(tg, tmp_path / "tg.json", start=False)
+    ch.register("Откат (контроль)")
+    state = tmp_path / "s.json"
+    state.write_text(json.dumps({"snapshot": {"equity": 100.0}}), encoding="utf-8")
+    lst = CommandListener(tg, bots=[("Тень", state, tmp_path / "c.json")], group=ch)
+
+    def feed(text, user, thread=None):
+        msg = {"chat": {"id": -1001}, "from": {"id": user}, "text": text}
+        if thread:
+            msg.update(message_thread_id=thread, is_topic_message=True)
+        lst.tg.updates = lambda: [{"update_id": 1, "message": msg}]
+        lst.poll_once()
+
+    feed("/here", user=999)                                # чужой не может привязать
+    assert not ch.bound
+    feed("/here@my_bot", user=111)
+    assert ch.chat_id == "-1001" and "Откат (контроль)" in ch.topics
+    feed("/pause", user=111)                               # управление в группе не работает
+    assert not (tmp_path / "c.json").exists()
+    n = len(api.sent())
+    feed("/help", user=999, thread=100)
+    reply = api.sent()[-1]
+    assert len(api.sent()) == n + 1 and reply["chat_id"] == "-1001" and reply["message_thread_id"] == 100
+
+
+def test_telegram_waits_and_retries_when_rate_limited(monkeypatch):
+    import bot.telegram as T
+    answers = [{"ok": False, "error_code": 429, "parameters": {"retry_after": 2}}, {"ok": True}]
+    waited = []
+    monkeypatch.setattr(T.time, "sleep", lambda s: waited.append(s))
+    tg = T.Telegram("T", 111, lambda m, p, t: answers.pop(0))
+    assert tg.send("x", wait_on_limit=True) and waited == [3.0]
+
+
+def test_engine_sends_every_open_and_close_with_balance(tmp_path):
+    sent = []
+
+    class Notifier:
+        def send(self, text, trade=False):
+            sent.append((trade, text))
+
+    cfg = shadow_cfg()
+    cfg["notify_trades"] = True
+    eng = Engine(cfg, tmp_path, notifier_for=lambda k: Notifier())
+    m = eng.add_market("ETHUSDT", book(100.0))
+    bot = eng.bots["fade"]
+    eng._enter(bot, m, S.Signal(1, sl_dist=1.0, tp_dist=2.0, reason="тест"), T0)
+    eng.advance(T0 + 1000)
+    bot.account.close("ETHUSDT", m.book, eng.now, "manual")
+    eng.advance(T0 + 2000)
+    trades = [t for flag, t in sent if flag]
+    assert len(trades) == 2 and "ОТКРЫТЬ ЛОНГ" in trades[0] and "ЗАКРЫТЬ ЛОНГ" in trades[1]
+    assert all(bot.title in t and "Баланс" in t and "Сделок:" in t for t in trades)
+    assert "Сделок: 1" in trades[1]

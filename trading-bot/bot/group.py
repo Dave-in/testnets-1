@@ -52,7 +52,7 @@ class Labeled:
     def __init__(self, tg, label: str):
         self.tg, self.label = tg, label
 
-    def send(self, text: str) -> bool:
+    def send(self, text: str, trade: bool = False) -> bool:
         return self.tg.send(f"<b>[{messages.escape(self.label)}]</b>\n{text}")
 
 
@@ -140,14 +140,18 @@ def build_group(path: str | Path, confirm_live: bool = False) -> Group:
         runners[spec.name] = Runner(cfg, market, broker, state_path_for(cfg), notifier)
 
     extra = {}
+    channel = None
     shadow_cfg = load_shadow(path)
     if shadow_cfg is not None:
-        extra = start_shadow(shadow_cfg, base / "state", tg)
+        if tg is not None:
+            from .telegram import ShadowChannel
+            channel = ShadowChannel(tg, base / "state" / "shadow_telegram.json")
+        extra = start_shadow(shadow_cfg, base / "state", tg, channel)
 
     if tg is not None:
         bots = [(n, r.state_path, control_path(r.state_path)) for n, r in runners.items()]
         bots += [(n, b.state_path, b.control_path) for n, b in extra.items()]
-        CommandListener(Telegram(token, chat), bots=bots).start()
+        CommandListener(Telegram(token, chat), bots=bots, group=channel).start()
         lines = [f"• <b>{messages.escape(s.name)}</b>: {cfgs[s.name].exchange.market}, "
                  f"монет {len(cfgs[s.name].portfolio.symbols)}, "
                  f"{'сигналы включены' if s.signals else 'без сигналов, только в отчётах'}"
@@ -155,14 +159,19 @@ def build_group(path: str | Path, confirm_live: bool = False) -> Group:
         if extra:
             lines.append(f"• <b>Теневые боты</b> ({len(extra)}): фьючерсы Bybit, исполнение по "
                          f"реальному стакану — " + ", ".join(messages.escape(n) for n in extra))
+            if channel is not None and not channel.bound:
+                lines.append("\n📢 Чтобы сделки теневых ботов шли в группу с темами: создайте "
+                             "группу, включите в ней «Темы», добавьте этого бота администратором "
+                             "с правом «Управление темами» и отправьте в группе /here")
         tg.send("🤖 Бот запущен, виртуальных счетов: " + str(len(specs) + len(extra)) + "\n"
                 + "\n".join(lines) + "\n/help — команды.")
     poll = min(c.live.poll_seconds for c in cfgs.values())
     return Group(runners, tg, poll, extra)
 
 
-def start_shadow(cfg: dict, state_dir: Path, tg=None) -> dict:
-    """Запустить теневых ботов в отдельном потоке. Возвращает {подпись: бот} для отчётов."""
+def start_shadow(cfg: dict, state_dir: Path, tg=None, channel=None) -> dict:
+    """Запустить теневых ботов в отдельном потоке. Возвращает {подпись: бот} для отчётов.
+    channel — группа с темами (ShadowChannel): каждый бот пишет сделки в свою тему."""
     import threading
 
     from .shadow.bybit import run_live
@@ -173,6 +182,9 @@ def start_shadow(cfg: dict, state_dir: Path, tg=None) -> dict:
     for bot in engine.bots.values():            # подписи в сообщениях — названиями стратегий
         if bot.notifier is not None:
             bot.notifier.label = f"Тень · {bot.title}"
+            if channel is not None:
+                from .telegram import TopicNotifier
+                bot.notifier = TopicNotifier(channel, bot.title, fallback=bot.notifier)
 
     def worker():
         warned = False
