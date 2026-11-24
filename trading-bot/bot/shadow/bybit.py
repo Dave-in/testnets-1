@@ -43,6 +43,35 @@ def book_depth_usd(symbol: str, pct: float) -> float:
     return min(sum(p * q for p, q in bids if p >= lo), sum(p * q for p, q in asks if p <= hi))
 
 
+def select_memes(cfg: dict) -> list[str]:
+    """Мем-токены из списка [meme_universe], у которых на Bybit сейчас достаточно оборота,
+    узкий спред и стакан. Топ по обороту здесь не исключается."""
+    u = cfg.get("meme_universe", {})
+    wanted = list(u.get("symbols", []))
+    if not wanted:
+        return []
+    min_turnover = float(u.get("min_turnover_usd", 5e6))
+    max_spread = float(u.get("max_spread_bps", 10.0)) / 1e4
+    depth_pct = float(u.get("depth_pct", 0.1))
+    min_depth = float(u.get("min_depth_usd", 3000.0))
+    tickers = {t["symbol"]: t for t in _get("/v5/market/tickers", {"category": "linear"})["list"]}
+    chosen = []
+    for s in wanted:
+        t = tickers.get(s)
+        if t is None:
+            continue
+        bid, ask = float(t.get("bid1Price") or 0), float(t.get("ask1Price") or 0)
+        spread = (ask - bid) / ((ask + bid) / 2) if bid > 0 and ask > 0 else 1.0
+        if float(t.get("turnover24h") or 0) < min_turnover or spread > max_spread:
+            continue
+        try:
+            if book_depth_usd(s, depth_pct) >= min_depth:
+                chosen.append(s)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Стакан %s не получен: %s", s, e)
+    return chosen
+
+
 def select_universe(cfg: dict) -> list[str]:
     """Монеты для торговли: только криптовалюты (без токенизированных акций, ETF, золота),
     без skip_top самых торгуемых за сутки, с оборотом, возрастом контракта, узким спредом
@@ -128,7 +157,9 @@ def warmup(engine: Engine, symbols: list[str]) -> None:
             log.warning("Правила контракта %s не получены: %s", s, e)
         try:
             kl = _get("/v5/market/kline", {"category": "linear", "symbol": s, "interval": 1, "limit": 500})
-            m.warmup_minutes([float(k[4]) for k in reversed(kl["list"])])
+            rows = list(reversed(kl["list"]))[:-1]     # последняя минута ещё не закрыта
+            m.warmup_minutes([float(k[4]) for k in rows])
+            m.minute_usd.extend(float(k[6]) for k in rows if len(k) > 6)   # оборот минуты, $
         except Exception as e:  # noqa: BLE001
             log.warning("Разогрев %s не удался: %s", s, e)
     try:
@@ -168,9 +199,11 @@ def handle_message(engine: Engine, msg: dict) -> None:
     if kind == "orderbook.50":
         if msg.get("type") == "snapshot" or data.get("u") == 1:
             m.book.snapshot(data.get("b", []), data.get("a", []), ts)
+            m._best = None                        # новый снимок — поток считаем заново
         else:
             m.book.delta(data.get("b", []), data.get("a", []), ts)
         engine.advance(ts)
+        m.on_book_update()
     elif kind == "publicTrade":
         for t in data:
             engine.on_trade(symbol, int(t["T"]), float(t["p"]), float(t["v"]), t["S"] == "Buy")
@@ -225,10 +258,18 @@ async def _stream(engine: Engine, symbols: list[str], stop: asyncio.Event) -> No
 def run_live(engine: Engine, stop: asyncio.Event | None = None) -> None:
     traded = select_universe(engine.cfg)
     log.info("Теневые боты: торгуем %d монет: %s", len(traded), ", ".join(traded))
+    engine.universes = {"base": set(traded)}
+    memes = []
+    if any(b.universe == "meme" for b in engine.bots.values()):
+        memes = select_memes(engine.cfg)
+        engine.universes["meme"] = set(memes)
+        log.info("Мем-бот: %d монет: %s", len(memes), ", ".join(memes) or "нет подходящих")
     ref = engine.cfg.get("lag", {}).get("ref", "BTCUSDT")
-    symbols = traded if ref in traded else [ref] + traded
+    symbols = list(dict.fromkeys(traded + memes))
+    if ref not in symbols:
+        symbols.insert(0, ref)
     warmup(engine, symbols)
-    if ref not in traded:                       # ориентир для «Отставания»: данные есть, сделок нет
+    if ref not in traded and ref not in memes:  # ориентир для «Отставания»: данные есть, сделок нет
         engine.markets[ref].tradable = False
         log.info("%s — только ориентир, не торгуется", ref)
     engine.refresh_all()

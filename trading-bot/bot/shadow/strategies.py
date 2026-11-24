@@ -12,53 +12,7 @@ from dataclasses import dataclass
 import numpy as np
 
 
-@dataclass
-class Signal:
-    side: int                  # +1 лонг, −1 шорт
-    sl_dist: float             # расстояние до стопа в цене
-    tp_dist: float = 0.0       # расстояние до тейка (0 — без тейка)
-    entry: str = "market"      # market | limit
-    limit_price: float = 0.0
-    limit_ttl_s: int = 15
-    time_stop_s: int = 0
-    trail: float = 0.0         # трейлинг-стоп (вместо фиксированного), в цене
-    reason: str = ""
-
-
-def _sign(x: float) -> int:
-    return 1 if x > 0 else (-1 if x < 0 else 0)
-
-
-class Strategy:
-    key = ""
-    title = ""
-    idea = ""
-    defaults: dict = {}
-
-    def __init__(self, **params) -> None:
-        unknown = set(params) - set(self.defaults)
-        if unknown:
-            raise ValueError(f"{self.key}: неизвестные параметры {sorted(unknown)}")
-        self.p = {**self.defaults, **params}
-        self.state: dict = {}
-        self.obs: dict = {}
-
-    def check(self, m, now: int, markets: dict) -> Signal | None:  # pragma: no cover
-        raise NotImplementedError
-
-    # --- калибровка: «почти сработавшие» сигналы ------------------------------------------
-    def observe(self, metric: str, value: float, threshold: float, symbol: str) -> None:
-        """Запомнить значение условия входа. За минуту хранится максимум по всем монетам —
-        по этим максимумам видно, как близко бот подходит к порогу и где порог поставить."""
-        if value is None or not math.isfinite(value):
-            return
-        cur = self.obs.get(metric)
-        if cur is None or value > cur[0]:
-            self.obs[metric] = (float(value), float(threshold), symbol)
-
-    def take_observations(self) -> dict:
-        out, self.obs = self.obs, {}
-        return out
+from .base import PairSignal, Signal, Strategy, _sign  # noqa: F401 — общие классы
 
 
 class LiquidationCascade(Strategy):
@@ -279,5 +233,8 @@ class FadeSpike(Strategy):
                       reason=f"движение {r * 100:+.2f}% за {p['window_s'] // 60} мин выдохлось")
 
 
+from .short_term import SHORT_TERM  # noqa: E402 — краткосрочные стратегии
+
 STRATEGIES = {cls.key: cls for cls in
-              (LiquidationCascade, BookImbalance, LeadLag, OpenInterestFlow, FundingSkew, FadeSpike)}
+              (LiquidationCascade, BookImbalance, LeadLag, OpenInterestFlow, FundingSkew, FadeSpike,
+               *SHORT_TERM)}

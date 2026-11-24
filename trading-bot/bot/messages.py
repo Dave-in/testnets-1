@@ -253,12 +253,16 @@ def shadow_trade(ev, title: str = "", summary: dict | None = None) -> str:
     if ev.action == "open":
         lines += [f"{'🟢' if ev.side > 0 else '🔴'} <b>ОТКРЫТЬ {side} {escape(ev.symbol)}</b>",
                   f"Цена: {price(ev.price)} (проскальзывание {ev.slippage_bps:+.1f} б.п.)",
-                  f"Сумма: {money(ev.price * ev.qty)} USDT",
+                  f"Сумма: {money(ev.price * ev.qty)} USDT"
+                  + (f" · плечо ×{summary['leverage']:.1f}" if summary and summary.get("leverage") else "")
+                  + (f" · ликвидация {price(summary['liq_price'])}"
+                     if summary and summary.get("liq_price") else ""),
                   f"Комиссия Bybit: {ev.fee:.4f} USDT ({kind(ev.maker, ev.fee_rate)})",
                   f"Причина: {escape(ev.reason)}"]
     else:
         why = {"tp": "тейк", "sl": "стоп", "time": "время вышло", "manual": "команда",
-               "liquidation": "ликвидация"}.get(ev.reason, ev.reason)
+               "liquidation": "ликвидация", "signal": "сигнал стратегии",
+               "pair_leg": "вторая нога пары не исполнилась"}.get(ev.reason, ev.reason)
         icon = "✅" if (ev.pnl or 0) >= 0 else "❌"
         lines += [f"⚪️ <b>ЗАКРЫТЬ {side} {escape(ev.symbol)}</b> — {why}",
                   f"Цена: {price(ev.price)} (проскальзывание {ev.slippage_bps:+.1f} б.п.)"]

@@ -33,6 +33,12 @@ class SymbolMarket:
         self.liq_minutes: deque = deque(maxlen=6 * 60)     # сумма ликвидаций по минутам, 6 ч
         self._liq_this_minute = 0.0
         self.oi: deque = deque()              # (ts, открытый интерес в $)
+        self.minute_usd: deque = deque(maxlen=6 * 60)      # оборот за каждую минуту, $, 6 ч
+        # поток ордеров (OFI, Cont–Kukanov–Stoikov): сумма за каждую секунду, час
+        self.ofi_sec: deque = deque(maxlen=3600)
+        self._ofi_this_sec = 0.0
+        self._best: tuple | None = None       # (bid, объём, ask, объём) после прошлого обновления
+        self.top_depth = 0.0                  # средний объём лучших уровней (для нормировки OFI)
         self.funding_rate = 0.0
         self.next_funding = 0                 # мс
         self.mark_price = 0.0
@@ -98,10 +104,40 @@ class SymbolMarket:
         if price <= 0:
             return
         self.sec.append(price)
+        self.ofi_sec.append(self._ofi_this_sec)
+        self._ofi_this_sec = 0.0
         if sec % 60 == 0:
             self.minute_closes.append(price)
             self.liq_minutes.append(self._liq_this_minute)
             self._liq_this_minute = 0.0
+            self.minute_usd.append(sum(usd for s, _, usd, _ in reversed(self.trades)
+                                       if s > sec - 60) if self.trades else 0.0)
+
+    def on_book_update(self) -> None:
+        """Изменение лучших заявок → вклад в поток ордеров (OFI):
+        e = [b≥b′]·qb − [b≤b′]·qb′ − [a≤a′]·qa + [a≥a′]·qa′ (штрих — до обновления)."""
+        book = self.book
+        if not book.ready or getattr(book, "approx", False):
+            return
+        (b, qb), = book.levels("bid", 1)
+        (a, qa), = book.levels("ask", 1)
+        prev = self._best
+        self._best = (b, qb, a, qa)
+        self.top_depth = (qb + qa) / 2 if not self.top_depth else \
+            0.999 * self.top_depth + 0.001 * (qb + qa) / 2
+        if prev is None:
+            return
+        pb, pqb, pa, pqa = prev
+        e = (qb if b >= pb else 0.0) - (pqb if b <= pb else 0.0) \
+            - (qa if a <= pa else 0.0) + (pqa if a >= pa else 0.0)
+        self._ofi_this_sec += e
+
+    def extreme_range(self, start_s: int, end_s: int, side: int) -> float:
+        """Максимум/минимум цены в отрезке от start_s до end_s секунд назад (start_s < end_s)."""
+        window = list(itertools.islice(reversed(self.sec), start_s, end_s + 1))
+        if not window:
+            return 0.0
+        return max(window) if side > 0 else min(window)
 
     # --- признаки -----------------------------------------------------------------
     def price(self) -> float:

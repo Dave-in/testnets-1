@@ -14,7 +14,7 @@ from pathlib import Path
 from .. import messages
 from .market import SymbolMarket
 from .sim import Account, Order, round_to_tick
-from .strategies import STRATEGIES
+from .strategies import STRATEGIES, PairSignal
 
 log = logging.getLogger(__name__)
 
@@ -33,7 +33,9 @@ class ShadowBot:
         params = {k: v for k, v in cfg.get(key, {}).items() if k in cls.defaults}
         self.key, self.title = key, cfg.get(key, {}).get("title", cls.title)
         self.strategy = cls(**params)
-        acc = cfg.get("account", {})
+        # общие настройки счёта [account] + свои у бота ([<бот>.account] в конфиге)
+        acc = {**cfg.get("account", {}), **cfg.get(key, {}).get("account", {})}
+        self.universe = cfg.get(key, {}).get("universe", "base")   # base | meme — какие монеты
         self.risk = float(acc.get("risk_per_trade", 0.01))
         self.max_leverage = float(acc.get("max_leverage", 10.0))
         self.max_positions = int(acc.get("max_positions", 3))
@@ -46,7 +48,8 @@ class ShadowBot:
                                                           acc.get("min_reward_cost", 2.5)))
         self.account = Account(key, float(acc.get("capital", 100.0)),
                                (float(acc.get("maker_fee", 0.0002)), float(acc.get("taker_fee", 0.00055))),
-                               int(acc.get("latency_ms", 250)))
+                               int(acc.get("latency_ms", 250)),
+                               leverage=float(acc["leverage"]) if acc.get("leverage") else None)
         self.state_path = Path(state_dir) / f"shadow_{key}.json"
         self.control_path = Path(state_dir) / f"shadow_{key}_control.json"
         self.journal_path = Path(state_dir) / f"shadow_{key}_trades.csv"
@@ -83,6 +86,9 @@ class Engine:
         self.source = source
         self.notify_trades = bool(cfg.get("notify_trades", False))
         self.markets: dict[str, SymbolMarket] = {}
+        # списки монет по именам (base — общий, meme — мемы); бот торгует только своим.
+        # Пусто — без ограничений (все подключённые монеты)
+        self.universes: dict[str, set] = {}
         keys = cfg.get("bots", DEFAULT_BOTS)
         self.bots = {k: ShadowBot(k, cfg, self.state_dir, notifier_for(k) if notifier_for else None)
                      for k in keys}
@@ -140,19 +146,37 @@ class Engine:
             acc.housekeeping(self.markets, now)
             if acc.check_liquidation(self.markets, now):
                 self._notify(bot, "💥 Счёт достиг уровня ликвидации — все позиции закрываются.")
+            try:                                  # выход по сигналу стратегии (например, пары)
+                for item in bot.strategy.manage(acc, self.markets, now) or ():
+                    if item[0] == "open":         # добрать ногу пары по рынку
+                        _, sym, sig, notional, tag, lone = item
+                        if not self._enter(bot, self.markets[sym], sig, now, notional, tag,
+                                           check_cost=False) and lone in acc.positions:
+                            acc.close(lone, self.markets[lone].book, now, "pair_leg")
+                        continue
+                    sym, purpose = item
+                    if sym in acc.positions:
+                        acc.close(sym, self.markets[sym].book, now, purpose)
+            except Exception:  # noqa: BLE001
+                log.exception("[%s] ошибка сопровождения позиций", bot.key)
+            allowed = self.universes.get(bot.universe)
+            bot.strategy.allowed = allowed
             if not bot.paused:
                 for sym, m in self.markets.items():
                     # ордера на вход, которые ещё не исполнились, тоже занимают место
                     if len(acc.positions) + len(acc.pending_entries()) >= bot.max_positions:
                         break
-                    if not m.tradable or acc.busy(sym, now):
+                    if not m.tradable or (allowed is not None and sym not in allowed) \
+                            or acc.busy(sym, now):
                         continue
                     try:
                         sig = bot.strategy.check(m, now, self.markets)
                     except Exception:  # noqa: BLE001 — ошибка в одной монете не валит остальное
                         log.exception("[%s] ошибка стратегии на %s", bot.key, sym)
                         continue
-                    if sig is not None:
+                    if isinstance(sig, PairSignal):
+                        self._enter_pair(bot, sig, now, allowed)
+                    elif sig is not None:
                         self._enter(bot, m, sig, now)
             self._drain(bot)
             if sec % self.save_every_s == 0:
@@ -163,38 +187,54 @@ class Engine:
             except OSError:
                 log.exception("Не удалось записать журнал калибровки")
 
-    def _enter(self, bot: ShadowBot, m: SymbolMarket, sig, now: int) -> None:
+    def _size(self, bot: ShadowBot, m: SymbolMarket, sig, sl_dist: float, prices: dict,
+              notional: float | None = None) -> float:
+        """Объём позиции: стоп стоит risk·капитала (или заданная сумма), в пределах плеча
+        на позицию и на счёт, свободной маржи и правил контракта Bybit. 0 — не входить."""
         acc, price = bot.account, m.price()
-        prices = {s: mk.price() for s, mk in self.markets.items()}
         equity = acc.equity(prices)
-        if equity <= 0 or sig.sl_dist <= 0 or not price:
-            return
-        # Слишком близкий стоп расширяем до min_stop_pct: позиция станет меньше, риск на сделку
-        # тот же, а комиссия — меньшая доля риска.
-        floor = bot.min_stop_pct * price
-        sl_dist = max(sig.sl_dist, floor)
-        trail = max(sig.trail, floor) if sig.trail else 0.0
-        qty = bot.risk * equity / sl_dist                         # стоп = risk·капитала
+        if equity <= 0 or not price:
+            return 0.0
+        qty = notional / price if notional else bot.risk * equity / sl_dist
         room = bot.max_leverage * equity - acc.committed(prices)
         qty = min(qty, max(room, 0.0) / price, bot.max_position_leverage * equity / price)
+        if acc.leverage:                          # изолированная маржа: хватает ли свободной
+            free = equity - acc.used_margin(prices)
+            qty = min(qty, max(free, 0.0) * acc.leverage / price)
         # правила контракта Bybit: предел рыночного ордера, шаг объёма (вниз), минимумы
         if m.max_mkt_qty and sig.entry != "limit":
             qty = min(qty, m.max_mkt_qty)
         if m.qty_step:
             qty = math.floor(qty / m.qty_step + 1e-9) * m.qty_step
         if qty <= 0 or qty < m.min_qty or qty * price < max(bot.min_notional, m.min_notional):
-            return
+            return 0.0
+        return qty
+
+    def _enter(self, bot: ShadowBot, m: SymbolMarket, sig, now: int, notional: float | None = None,
+               tag: str = "", check_cost: bool = True) -> bool:
+        acc, price = bot.account, m.price()
+        prices = {s: mk.price() for s, mk in self.markets.items()}
+        if sig.sl_dist <= 0 or not price:
+            return False
+        # Слишком близкий стоп расширяем до min_stop_pct: позиция станет меньше, риск на сделку
+        # тот же, а комиссия — меньшая доля риска.
+        floor = bot.min_stop_pct * price
+        sl_dist = max(sig.sl_dist, floor)
+        trail = max(sig.trail, floor) if sig.trail else 0.0
+        qty = self._size(bot, m, sig, sl_dist, prices, notional)
+        if qty <= 0:
+            return False
         # Сигналы, где тейк меньше min_reward_cost издержек сделки, пропускаем: на них комиссии
         # и проскальзывание съедают всё. Издержки — по текущему стакану для этого объёма.
-        if sig.tp_dist:
+        if sig.tp_dist and check_cost:
             cost = self.trade_cost(acc, m, sig, qty)
             ratio = (sig.tp_dist / price) / cost if cost > 0 else math.inf
             bot.strategy.observe("тейк / издержки сделки", ratio, bot.min_reward_cost, m.symbol)
             if ratio < bot.min_reward_cost:
-                return
+                return False
         meta = {"sl_dist": sl_dist, "tp_dist": sig.tp_dist, "time_stop_s": sig.time_stop_s,
                 "trail": trail, "reason": sig.reason, "mid0": m.book.mid() or price,
-                "tick": m.tick}
+                "tick": m.tick, "tag": tag}
         side = "buy" if sig.side > 0 else "sell"
         if sig.entry == "limit":
             limit = round_to_tick(sig.limit_price, m.tick, up=sig.side < 0)
@@ -203,6 +243,31 @@ class Engine:
         else:
             o = Order(m.symbol, side, "market", qty, meta=meta)
         acc.submit(o, m.book, now)
+        return True
+
+    def _enter_pair(self, bot: ShadowBot, ps, now: int, allowed) -> None:
+        """Сделка из двух ног (парный арбитраж): обе ноги или ни одной. Размер первой ноги —
+        из риска на сделку, второй — сумма первой × β (нейтрально к общему движению рынка)."""
+        acc = bot.account
+        if len(acc.positions) + len(acc.pending_entries()) + 2 > bot.max_positions:
+            return
+        legs = []
+        for sym, sig in ps.legs:
+            m = self.markets.get(sym)
+            if m is None or not m.tradable or acc.busy(sym, now) or \
+                    (allowed is not None and sym not in allowed):
+                return
+            legs.append((m, sig))
+        prices = {s: mk.price() for s, mk in self.markets.items()}
+        equity = acc.equity(prices)
+        (m1, s1), (m2, s2) = legs
+        n1 = min(bot.risk * equity / ps.risk_frac, bot.max_position_leverage * equity)
+        n2 = n1 * abs(ps.ratio)
+        if self._size(bot, m1, s1, s1.sl_dist, prices, n1) <= 0 or \
+                self._size(bot, m2, s2, s2.sl_dist, prices, n2) <= 0:
+            return
+        if self._enter(bot, m1, s1, now, n1, ps.tag, check_cost=False):
+            self._enter(bot, m2, s2, now, n2, ps.tag, check_cost=False)
 
     @staticmethod
     def trade_cost(acc: Account, m: SymbolMarket, sig, qty: float) -> float:
@@ -270,8 +335,12 @@ class Engine:
                     w.writeheader()
                 w.writerow(row)
             if self.notify_trades and bot.notifier is not None:
-                self._notify(bot, messages.shadow_trade(ev, bot.title, self.account_summary(bot)),
-                             trade=True)
+                summary = self.account_summary(bot)
+                if ev.action == "open" and summary["equity"] > 0:
+                    pos = bot.account.positions.get(ev.symbol)
+                    summary["leverage"] = ev.qty * ev.price / summary["equity"]
+                    summary["liq_price"] = pos.liq_price if pos is not None else 0.0
+                self._notify(bot, messages.shadow_trade(ev, bot.title, summary), trade=True)
         bot.account.events.clear()
 
     def account_summary(self, bot: ShadowBot) -> dict:

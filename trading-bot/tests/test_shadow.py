@@ -291,8 +291,8 @@ def test_default_config_loads_all_six_bots(tmp_path):
     with open(root / "config.shadow.toml", "rb") as f:
         cfg = tomllib.load(f)
     eng = Engine(cfg, tmp_path)
-    assert list(eng.bots) == ["liq", "book", "lag", "oi", "fund", "fade"]
-    assert len({b.title for b in eng.bots.values()}) == 6
+    assert list(eng.bots)[:6] == ["liq", "book", "lag", "oi", "fund", "fade"]
+    assert len({b.title for b in eng.bots.values()}) == len(eng.bots) == 11
     assert all(b.account.start == 100.0 for b in eng.bots.values())
 
 

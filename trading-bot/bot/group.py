@@ -39,8 +39,8 @@ def load_group(path: str | Path) -> list[BotSpec]:
     with open(path, "rb") as f:
         raw = tomllib.load(f)
     specs = [BotSpec(**b) for b in raw.get("bot", [])]
-    if not specs:
-        raise SystemExit(f"В {path} нет ни одного блока [[bot]]")
+    if not specs and not raw.get("shadow", {}).get("enabled", False):
+        raise SystemExit(f"В {path} нет ни одного блока [[bot]] и выключены теневые боты")
     if len({s.name for s in specs}) != len(specs):
         raise SystemExit(f"В {path} повторяются имена ботов")
     return specs
@@ -123,7 +123,8 @@ def build_group(path: str | Path, confirm_live: bool = False) -> Group:
 
     tg = None
     token, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
-    if any(c.telegram.enabled for c in cfgs.values()):
+    # без дневных счетов Telegram включается, если он настроен в .env
+    if any(c.telegram.enabled for c in cfgs.values()) or (not cfgs and token and chat):
         if not token or not chat:
             raise SystemExit("Нет TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID в .env. См. README.")
         from .telegram import CommandListener, Telegram
@@ -174,7 +175,7 @@ def build_group(path: str | Path, confirm_live: bool = False) -> Group:
                          "темами» и отправьте в группе /here")
         tg.send("🤖 Бот запущен, виртуальных счетов: " + str(len(specs) + len(extra)) + "\n"
                 + "\n".join(lines) + "\n/help — команды.")
-    poll = min(c.live.poll_seconds for c in cfgs.values())
+    poll = min((c.live.poll_seconds for c in cfgs.values()), default=60)
     return Group(runners, tg, poll, extra)
 
 

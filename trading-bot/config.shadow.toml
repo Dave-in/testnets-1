@@ -1,8 +1,8 @@
-# Шесть теневых ботов: виртуальные деньги, исполнение по реальному стакану Bybit.
+# Теневые боты (6 первых + 5 краткосрочных с плечом): виртуальные деньги, исполнение по реальному стакану Bybit.
 # Ордера на биржу не отправляются; ключи API не нужны (только публичные данные).
 # Запуск отдельно: python -m bot shadow   |   вместе с остальными ботами — см. bots.toml.
 
-bots = ["liq", "book", "lag", "oi", "fund", "fade"]
+bots = ["liq", "book", "lag", "oi", "fund", "fade", "vwap", "squeeze", "pairs", "ofi", "meme"]
 notify_trades = true       # каждая сделка — в тему бота в группе Telegram (группу привязывает /here)
 save_every_s = 60
 
@@ -83,3 +83,85 @@ z = 3.0
 quiet_s = 30
 sl_sigma = 1.0
 time_stop_s = 900
+
+# ---------------------------------------------------------------------------------------------
+# Краткосрочные боты с плечом. Изолированная маржа как на Bybit: leverage — настройка плеча
+# на бирже (маржа позиции = сумма / плечо, ликвидация по марк-цене). Размер позиции — из риска:
+# стоп стоит risk_per_trade баланса; пределы — max_position_leverage на позицию и max_leverage
+# на счёт. Лонг и шорт без ограничений.
+
+[vwap]                     # 7. Возврат к VWAP (процесс Орнштейна–Уленбека), вход и тейк лимитками
+z_entry = 2.0              # вход при отклонении от VWAP за 15 мин на 2σ…
+z_stop = 3.5               # …стоп при 3.5σ
+max_half_life = 10.0       # только монеты в режиме возврата: полупериод ≤ 10 мин…
+max_vr = 0.9               # …и отношение дисперсий VR(5) < 0.9 (склонность к откатам)
+max_hold_min = 20
+[vwap.account]
+risk_per_trade = 0.01
+leverage = 20.0
+max_position_leverage = 10.0
+max_leverage = 20.0
+max_positions = 3
+
+[squeeze]                  # 8. Пробой после сжатия полос Боллинджера, с объёмом
+bw_pct = 10.0              # полосы уже 10% самых узких за 6 ч
+range_s = 1800             # пробой диапазона последних 30 мин
+vol_z = 2.0                # объём минуты выше обычного на 2σ
+tp_atr = 3.0
+trail_atr = 1.5
+time_stop_s = 1800
+[squeeze.account]
+risk_per_trade = 0.01
+leverage = 20.0
+max_position_leverage = 10.0
+max_leverage = 20.0
+max_positions = 3
+
+[pairs]                    # 9. Парный арбитраж: коинтеграция, лонг одной монеты + шорт другой
+corr_min = 0.8             # корреляция минутных доходностей за 6 ч
+adf_t = -3.34              # спред стационарен (Энгл–Грейнджер, ~5%)
+z_entry = 2.0
+z_exit = 0.5
+z_stop = 4.0
+max_hold_min = 120
+[pairs.account]
+risk_per_trade = 0.01
+leverage = 20.0
+max_position_leverage = 10.0
+max_leverage = 20.0
+max_positions = 4          # 2 пары по 2 ноги
+
+[ofi]                      # 10. Поток ордеров (OFI) + лямбда Кайла, вход лимиткой
+min_r2 = 0.05              # связь OFI → цена по последнему часу заметна
+min_reward_cost = 3.0      # прогноз хода ≥ 3 × издержек сделки
+time_stop_s = 120
+[ofi.account]
+risk_per_trade = 0.01
+leverage = 20.0
+max_position_leverage = 10.0
+max_leverage = 20.0
+max_positions = 3
+
+[meme]                     # 11. Мемы: возврат к VWAP, агрессивно
+universe = "meme"          # торгует только монетами из [meme_universe]
+z_entry = 1.5
+z_stop = 3.0
+max_half_life = 15.0
+max_vr = 0.95
+max_hold_min = 30
+[meme.account]
+risk_per_trade = 0.03      # стоп стоит 3% баланса
+leverage = 20.0
+max_position_leverage = 20.0
+max_leverage = 20.0
+max_positions = 3
+
+[meme_universe]            # мем-токены; берутся те, у кого сейчас есть оборот и стакан
+symbols = ["DOGEUSDT", "1000PEPEUSDT", "SHIB1000USDT", "WIFUSDT", "1000BONKUSDT", "FARTCOINUSDT",
+           "PENGUUSDT", "POPCATUSDT", "1000FLOKIUSDT", "TRUMPUSDT", "BRETTUSDT", "MEWUSDT",
+           "MOODENGUSDT", "PNUTUSDT", "GOATUSDT", "SPXUSDT", "PUMPFUNUSDT", "BOMEUSDT",
+           "USELESSUSDT", "1000NEIROCTOUSDT", "MEMEUSDT", "PEOPLEUSDT"]
+min_turnover_usd = 5e6
+max_spread_bps = 10.0
+depth_pct = 0.1
+min_depth_usd = 3000.0

@@ -754,7 +754,8 @@ def test_turbo_config_is_paper_only_and_bounded():
     assert cfg.exchange.mode == "paper" and cfg.exchange.market == "futures"
     assert cfg.challenge.enabled and cfg.challenge.target_mult == 10
     assert cfg.portfolio.max_gross_exposure <= 5.0 and cfg.portfolio.initial_capital == 50.0
-    assert any(s.config == "config.turbo.toml" for s in load_group(root / "bots.toml"))
+    # дневные счета (и Турбо) выключены в bots.toml 2026-11-24 — только краткосрочные боты
+    assert not any(s.config == "config.turbo.toml" for s in load_group(root / "bots.toml"))
 
 
 def test_cashout_and_target_commands(tmp_path):

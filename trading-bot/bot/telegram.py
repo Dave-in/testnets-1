@@ -192,10 +192,35 @@ class ShadowChannel:
                 + ".\nКаждый бот пишет в свою тему. /status, /report и /calib работают в этой группе.")
 
     def ensure_topics(self) -> None:
-        """Группа уже привязана, а бот новый (его не было при /here) — создать ему тему."""
-        if not self.bound or all(t in self.topics for t in self.titles):
+        """Группа уже привязана, а боты новые (их не было при /here): сначала переименовать
+        под них темы ботов, которых больше нет, остальным создать новые темы."""
+        if not self.bound:
             return
-        log.info("Создаю темы для новых ботов: %s", self.bind(self.chat_id)[:200])
+        missing = [t for t in self.titles if t not in self.topics]
+        stale = [t for t in self.topics if t not in self.titles]
+        renamed = {}
+        for new, old in zip(missing, stale):
+            try:
+                res = self.tg.call("editForumTopic", {"chat_id": self.chat_id,
+                                                      "message_thread_id": self.topics[old],
+                                                      "name": new[:128]})
+            except Exception as e:  # noqa: BLE001
+                res = {"ok": False, "description": str(e)}
+            if res.get("ok"):
+                renamed[new] = self.topics[old]
+                log.info("Тема «%s» переименована в «%s»", old, new)
+            else:
+                log.warning("Не удалось переименовать тему «%s»: %s", old, res.get("description"))
+        if renamed:
+            with self.lock:
+                for new, tid in renamed.items():
+                    self.topics[new] = tid
+                self.topics = {t: i for t, i in self.topics.items()
+                               if t in self.titles or i not in renamed.values()}
+                self.path.write_text(json.dumps({"chat_id": self.chat_id, "topics": self.topics},
+                                                ensure_ascii=False), encoding="utf-8")
+        if any(t not in self.topics for t in self.titles):
+            log.info("Создаю темы для новых ботов: %s", self.bind(self.chat_id)[:200])
 
     def post(self, title: str, text: str) -> bool:
         """Поставить сообщение в очередь темы бота. False — группа не привязана."""

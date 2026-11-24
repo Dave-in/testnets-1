@@ -66,6 +66,9 @@ class Position:
     realized: float = 0.0      # результат уже закрытых частей позиции (до комиссий)
     closed_qty: float = 0.0
     entry_maker: bool = False  # вход лимиткой (комиссия мейкера) или по рынку (тейкера)
+    margin: float = 0.0        # изолированная маржа позиции (0 — счёт без модели маржи)
+    liq_price: float = 0.0     # цена ликвидации позиции при этой марже
+    tag: str = ""              # метка стратегии (например, пара парного арбитража)
 
 
 @dataclass
@@ -91,12 +94,18 @@ class FillReport:
 
 
 class Account:
-    def __init__(self, name: str, capital: float, fees=(0.0002, 0.00055), latency_ms: int = 250):
+    def __init__(self, name: str, capital: float, fees=(0.0002, 0.00055), latency_ms: int = 250,
+                 leverage: float | None = None, maintenance: float = 0.005):
+        """leverage — настройка плеча на бирже при изолированной марже (как на Bybit):
+        маржа позиции = сумма / плечо, ликвидация — когда убыток съел маржу до поддерживающей.
+        None — без модели маржи (только общие пределы суммы позиций)."""
         self.name = name
         self.start = capital
         self.cash = capital
         self.maker_fee, self.taker_fee = fees
         self.latency = latency_ms
+        self.leverage = leverage
+        self.maintenance = maintenance
         self.positions: dict[str, Position] = {}
         self.orders: list[Order] = []
         self.stats = {"closed": 0, "wins": 0, "realized": 0.0, "fees": 0.0, "funding": 0.0,
@@ -120,6 +129,18 @@ class Account:
         """Объём открытых позиций плюс ордеров на вход, которые ещё могут исполниться."""
         return self.gross(prices) + sum(o.qty * (o.price or prices.get(o.symbol, 0.0))
                                         for o in self.pending_entries())
+
+    def used_margin(self, prices: dict[str, float]) -> float:
+        """Маржа открытых позиций и ордеров на вход (только при модели изолированной маржи)."""
+        if not self.leverage:
+            return 0.0
+        return (sum(p.margin for p in self.positions.values())
+                + sum(o.qty * (o.price or prices.get(o.symbol, 0.0)) for o in self.pending_entries())
+                / self.leverage)
+
+    def liquidation_price(self, side: int, entry: float) -> float:
+        lev = self.leverage
+        return entry * (1 - side / lev + side * self.maintenance) if lev else 0.0
 
     def busy(self, symbol: str, now: int) -> bool:
         return (symbol in self.positions or self.cooldown.get(symbol, 0) > now
@@ -207,7 +228,10 @@ class Account:
             pos = Position(o.symbol, sign, qty, price, now, reason=m.get("reason", ""),
                            time_stop=now + int(m.get("time_stop_s", 0) * 1000) if m.get("time_stop_s") else 0,
                            trail=m.get("trail", 0.0), best=price, fees=fee, slippage_bps=slip,
-                           entry_maker=maker)
+                           entry_maker=maker, tag=m.get("tag", ""))
+            if self.leverage:                     # изолированная маржа, как на Bybit
+                pos.margin = price * qty / self.leverage
+                pos.liq_price = self.liquidation_price(sign, price)
             tick = m.get("tick", 0.0)
             close_side = "sell" if sign > 0 else "buy"
             # защитные ордера ставятся после исполнения входа и тоже идут до биржи latency мс
@@ -279,6 +303,11 @@ class Account:
         for s, pos in list(self.positions.items()):
             m = markets[s]
             price = m.price()
+            if pos.liq_price:                     # изолированная маржа: ликвидация по марк-цене
+                mark = m.mark_price or price
+                if (mark - pos.liq_price) * pos.side <= 0:
+                    self.close(s, m.book, now, "liquidation")
+                    continue
             if pos.time_stop and now >= pos.time_stop:
                 self.close(s, m.book, now, "time")
                 continue
