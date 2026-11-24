@@ -145,7 +145,7 @@ class Engine:
                     # ордера на вход, которые ещё не исполнились, тоже занимают место
                     if len(acc.positions) + len(acc.pending_entries()) >= bot.max_positions:
                         break
-                    if acc.busy(sym, now):
+                    if not m.tradable or acc.busy(sym, now):
                         continue
                     try:
                         sig = bot.strategy.check(m, now, self.markets)

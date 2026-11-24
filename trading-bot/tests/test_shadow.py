@@ -784,3 +784,51 @@ def test_tg_setup_takes_private_chat_not_group(tmp_path, monkeypatch):
     monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
     cli.cmd_tg_setup(types.SimpleNamespace(wait=1))
     assert "TELEGRAM_CHAT_ID=777" in (tmp_path / ".env").read_text(encoding="utf-8")
+
+
+def test_universe_skips_most_traded_and_reference_is_data_only(tmp_path, monkeypatch):
+    from bot.shadow import bybit
+    old = "1600000000000"
+    coins = [("BTCUSDT", 9e9), ("ETHUSDT", 3e9), ("HOTUSDT", 1e9), ("MIDUSDT", 5e7),
+             ("LOWUSDT", 2e7), ("TINYUSDT", 1e6)]
+    inst = [{"symbol": s, "status": "Trading", "contractType": "LinearPerpetual",
+             "launchTime": old, "symbolType": ""} for s, _ in coins]
+
+    def fake_get(path, params):
+        if path.endswith("instruments-info"):
+            return {"list": inst if "symbol" not in params else
+                    [i for i in inst if i["symbol"] == params["symbol"]]}
+        if path.endswith("tickers"):
+            return {"list": [{"symbol": s, "turnover24h": str(v), "bid1Price": "100.0",
+                              "ask1Price": "100.01"} for s, v in coins]}
+        if path.endswith("kline"):
+            return {"list": [[0, 0, 0, 0, "100"]] * 100}
+        return {"b": [["100.0", 1000]], "a": [["100.01", 1000]]}
+
+    monkeypatch.setattr(bybit, "_get", fake_get)
+    cfg = {"universe": {"skip_top": 3, "min_turnover_usd": 1e7}, "bots": ["fade"]}
+    assert bybit.select_universe(cfg) == ["MIDUSDT", "LOWUSDT"]        # топ-3 и мелочь — мимо
+
+    eng = Engine(cfg, tmp_path)
+    started = []
+
+    async def fake_stream(engine, symbols, stop):
+        started.append(symbols)
+    monkeypatch.setattr(bybit, "_stream", fake_stream)
+    bybit.run_live(eng)
+    assert started[0][0] == "BTCUSDT" and not eng.markets["BTCUSDT"].tradable
+    assert eng.markets["MIDUSDT"].tradable
+
+    class Always(S.Strategy):
+        key, title, defaults = "fade", "x", {}
+
+        def check(self, m, now, markets):
+            return S.Signal(1, m.price() * 0.01, m.price() * 0.05)
+
+    eng.bots["fade"].strategy = Always()
+    for s in eng.markets:
+        eng.markets[s].book = book(100.0, size=1e6)
+    eng.advance(T0)
+    eng.advance(T0 + 2000)
+    assert "BTCUSDT" not in {o.symbol for o in eng.bots["fade"].account.orders} | \
+        set(eng.bots["fade"].account.positions)

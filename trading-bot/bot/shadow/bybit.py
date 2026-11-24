@@ -44,11 +44,14 @@ def book_depth_usd(symbol: str, pct: float) -> float:
 
 
 def select_universe(cfg: dict) -> list[str]:
-    """Монеты по ликвидности: только криптовалюты (без токенизированных акций, ETF, золота),
-    оборот за сутки, возраст контракта, узкий спред и достаточная глубина стакана."""
+    """Монеты для торговли: только криптовалюты (без токенизированных акций, ETF, золота),
+    без skip_top самых торгуемых за сутки, с оборотом, возрастом контракта, узким спредом
+    и достаточной глубиной стакана. Ориентир для «Отставания» (BTC) сюда не входит —
+    его поток подключается отдельно и не торгуется (см. run_live)."""
     u = cfg.get("universe", {})
     if u.get("symbols"):
         return list(u["symbols"])
+    skip_top = int(u.get("skip_top", 0))
     min_turnover = float(u.get("min_turnover_usd", 30e6))
     min_age_ms = int(float(u.get("min_age_days", 60)) * 86400 * 1000)
     exclude = set(u.get("exclude", []))
@@ -67,21 +70,26 @@ def select_universe(cfg: dict) -> list[str]:
         if not cursor:
             break
     now = int(time.time() * 1000)
-    rows = []
+    crypto = []                                   # (оборот, монета, возраст ок, спред)
     for t in _get("/v5/market/tickers", {"category": "linear"})["list"]:
         s, info = t["symbol"], instruments.get(t["symbol"], {})
         if (not s.endswith("USDT") or s in exclude or info.get("status") != "Trading"
                 or info.get("contractType") != "LinearPerpetual"
-                or now - int(info.get("launchTime", now)) < min_age_ms
                 or (info.get("symbolType") or "").lower() in exclude_types):
             continue
         turnover = float(t.get("turnover24h") or 0)
         bid, ask = float(t.get("bid1Price") or 0), float(t.get("ask1Price") or 0)
         spread = (ask - bid) / ((ask + bid) / 2) if bid > 0 and ask > 0 else 1.0
-        if turnover >= min_turnover and spread <= max_spread:
-            rows.append((turnover, s))
+        old_enough = now - int(info.get("launchTime", now)) >= min_age_ms
+        crypto.append((turnover, s, old_enough, spread))
+    crypto.sort(reverse=True)
+    skipped = [s for _, s, _, _ in crypto[:skip_top]]
+    if skipped:
+        log.info("Самые торгуемые, не берём: %s", ", ".join(skipped))
+    rows = [(v, s) for v, s, old_enough, spread in crypto[skip_top:]
+            if old_enough and v >= min_turnover and spread <= max_spread]
     chosen = []
-    for _, s in sorted(rows, reverse=True):
+    for _, s in rows:
         if len(chosen) >= top:
             break
         try:
@@ -93,9 +101,6 @@ def select_universe(cfg: dict) -> list[str]:
             chosen.append(s)
         else:
             log.info("%s пропущена: в пределах %.2f%% всего %.0f $", s, depth_pct, depth)
-    ref = cfg.get("lag", {}).get("ref", "BTCUSDT")
-    if ref not in chosen:
-        chosen.insert(0, ref)
     return chosen
 
 
@@ -218,8 +223,13 @@ async def _stream(engine: Engine, symbols: list[str], stop: asyncio.Event) -> No
 
 
 def run_live(engine: Engine, stop: asyncio.Event | None = None) -> None:
-    symbols = select_universe(engine.cfg)
-    log.info("Теневые боты: монеты %s", ", ".join(symbols))
+    traded = select_universe(engine.cfg)
+    log.info("Теневые боты: торгуем %d монет: %s", len(traded), ", ".join(traded))
+    ref = engine.cfg.get("lag", {}).get("ref", "BTCUSDT")
+    symbols = traded if ref in traded else [ref] + traded
     warmup(engine, symbols)
+    if ref not in traded:                       # ориентир для «Отставания»: данные есть, сделок нет
+        engine.markets[ref].tradable = False
+        log.info("%s — только ориентир, не торгуется", ref)
     engine.refresh_all()
     asyncio.run(_stream(engine, symbols, stop or asyncio.Event()))
