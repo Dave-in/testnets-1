@@ -801,3 +801,36 @@ def test_cashout_and_target_commands(tmp_path):
     control_path(tmp_path / "p.json").write_text(json.dumps({"command": "cashout"}))
     plain.step()
     assert plain.attempts == [] and not plain.paused
+
+
+def test_signal_accounts_post_to_their_own_topic(tmp_path):
+    from bot.group import Labeled
+    from bot.telegram import ShadowChannel, Telegram, TopicNotifier
+
+    calls, topic = [], [200]
+
+    def post(method, payload, timeout):
+        calls.append((method, payload))
+        if method == "createForumTopic":
+            topic[0] += 1
+            return {"ok": True, "result": {"message_thread_id": topic[0]}}
+        return {"ok": True}
+
+    tg = Telegram("T", 111, post)
+    ch = ShadowChannel(tg, tmp_path / "tg.json", start=False)
+    fut = TopicNotifier(ch, "Фьючерсы", fallback=Labeled(tg, "Фьючерсы"))
+    fut.send("🔴 ОТКРЫТЬ ШОРТ BTC/USDT")                 # группы ещё нет — в личный чат с подписью
+    last = [p for m, p in calls if m == "sendMessage"][-1]
+    assert last["chat_id"] == "111" and last["text"].startswith("<b>[Фьючерсы]</b>")
+    ch.bind("-100777")
+    fut.send("🔴 ОТКРЫТЬ ШОРТ SOL/USDT")
+    ch.send_one(*ch.queue.get_nowait())
+    last = [p for m, p in calls if m == "sendMessage"][-1]
+    assert last["chat_id"] == "-100777" and last["message_thread_id"] == 201
+    # после перезапуска добавился новый бот — тема создаётся, старые не дублируются
+    ch2 = ShadowChannel(tg, tmp_path / "tg.json", start=False)
+    TopicNotifier(ch2, "Фьючерсы")
+    TopicNotifier(ch2, "Турбо")
+    ch2.ensure_topics()
+    assert ch2.topics == {"Фьючерсы": 201, "Турбо": 202}
+    assert sum(m == "createForumTopic" for m, _ in calls) == 2

@@ -129,6 +129,13 @@ def build_group(path: str | Path, confirm_live: bool = False) -> Group:
         from .telegram import CommandListener, Telegram
         tg = Telegram(token, chat)
 
+    # Группа с темами: у каждого счёта с сигналами и у каждого теневого бота своя тема.
+    # Пока группа не привязана (/here), сообщения идут в личный чат, как раньше.
+    channel = None
+    if tg is not None:
+        from .telegram import ShadowChannel, TopicNotifier
+        channel = ShadowChannel(tg, base / "state" / "shadow_telegram.json")
+
     runners: dict[str, Runner] = {}
     markets: dict[str, object] = {}
     for spec in specs:
@@ -136,17 +143,17 @@ def build_group(path: str | Path, confirm_live: bool = False) -> Group:
         cfg.telegram.daily_report = False  # отчёт за день — один общий на все счета
         market, broker = build_parts(cfg, confirm_live, markets.get(cfg.exchange.name))
         markets[cfg.exchange.name] = market
-        notifier = Labeled(tg, spec.name) if tg is not None and spec.signals else None
+        notifier = None
+        if tg is not None and spec.signals:
+            notifier = TopicNotifier(channel, spec.name, fallback=Labeled(tg, spec.name))
         runners[spec.name] = Runner(cfg, market, broker, state_path_for(cfg), notifier)
 
     extra = {}
-    channel = None
     shadow_cfg = load_shadow(path)
     if shadow_cfg is not None:
-        if tg is not None:
-            from .telegram import ShadowChannel
-            channel = ShadowChannel(tg, base / "state" / "shadow_telegram.json")
         extra = start_shadow(shadow_cfg, base / "state", tg, channel)
+    if channel is not None and channel.bound:
+        channel.ensure_topics()                # тема для бота, добавленного после /here
 
     if tg is not None:
         bots = [(n, r.state_path, control_path(r.state_path)) for n, r in runners.items()]
@@ -161,10 +168,10 @@ def build_group(path: str | Path, confirm_live: bool = False) -> Group:
         if extra:
             lines.append(f"• <b>Теневые боты</b> ({len(extra)}): фьючерсы Bybit, исполнение по "
                          f"реальному стакану — " + ", ".join(messages.escape(n) for n in extra))
-            if channel is not None and not channel.bound:
-                lines.append("\n📢 Чтобы сделки теневых ботов шли в группу с темами: создайте "
-                             "группу, включите в ней «Темы», добавьте этого бота администратором "
-                             "с правом «Управление темами» и отправьте в группе /here")
+        if channel is not None and channel.titles and not channel.bound:
+            lines.append("\n📢 Чтобы каждый бот писал в свою ветку группы: включите в группе "
+                         "«Темы», сделайте этого бота администратором с правом «Управление "
+                         "темами» и отправьте в группе /here")
         tg.send("🤖 Бот запущен, виртуальных счетов: " + str(len(specs) + len(extra)) + "\n"
                 + "\n".join(lines) + "\n/help — команды.")
     poll = min(c.live.poll_seconds for c in cfgs.values())

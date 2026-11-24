@@ -137,7 +137,7 @@ class Telegram:
 
 
 class ShadowChannel:
-    """Группа Telegram с темами: у каждого теневого бота своя тема.
+    """Группа Telegram с темами: у каждого бота (счёта с сигналами и теневого) своя тема.
 
     Группу привязывает владелец командой /here в самой группе (бот должен быть админом
     с правом «Управление темами»). Привязка и номера тем хранятся в файле и переживают
@@ -189,7 +189,13 @@ class ShadowChannel:
             self.path.write_text(json.dumps({"chat_id": chat_id, "topics": topics},
                                             ensure_ascii=False), encoding="utf-8")
         return ("✅ Группа привязана. Темы ботов: " + ", ".join(messages.escape(t) for t in topics)
-                + ".\nСюда будут приходить все сделки. /status и /report работают в этой группе.")
+                + ".\nКаждый бот пишет в свою тему. /status, /report и /calib работают в этой группе.")
+
+    def ensure_topics(self) -> None:
+        """Группа уже привязана, а бот новый (его не было при /here) — создать ему тему."""
+        if not self.bound or all(t in self.topics for t in self.titles):
+            return
+        log.info("Создаю темы для новых ботов: %s", self.bind(self.chat_id)[:200])
 
     def post(self, title: str, text: str) -> bool:
         """Поставить сообщение в очередь темы бота. False — группа не привязана."""
@@ -222,8 +228,8 @@ class ShadowChannel:
 
 
 class TopicNotifier:
-    """Уведомления одного теневого бота: в его тему в группе. Пока группа не привязана,
-    предупреждения идут в личный чат (fallback), а сделки не отправляются."""
+    """Уведомления одного бота — в его тему в группе. Пока группа не привязана, сообщения идут
+    в личный чат (fallback); только сделки теневых ботов (trade=True) тогда не отправляются."""
 
     def __init__(self, channel: ShadowChannel, title: str, fallback=None):
         self.channel, self.title, self.fallback = channel, title, fallback
