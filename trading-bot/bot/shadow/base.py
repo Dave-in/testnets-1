@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -16,6 +16,7 @@ class Signal:
     time_stop_s: int = 0
     trail: float = 0.0         # трейлинг-стоп (вместо фиксированного), в цене
     reason: str = ""
+    features: dict = field(default_factory=dict)   # числа, на которых основан сигнал (для анализа)
 
 
 @dataclass
@@ -47,6 +48,7 @@ class Strategy:
         self.p = {**self.defaults, **params}
         self.state: dict = {}
         self.obs: dict = {}
+        self.cur: dict = {}                 # условия входа по монете последней проверки
         self.allowed: set | None = None     # монеты, которыми бот может торговать (задаёт движок)
 
     def check(self, m, now: int, markets: dict) -> Signal | PairSignal | None:  # pragma: no cover
@@ -63,6 +65,7 @@ class Strategy:
         по этим максимумам видно, как близко бот подходит к порогу и где порог поставить."""
         if value is None or not math.isfinite(value):
             return
+        self.cur[metric] = float(value)         # значения по текущей монете — признаки сигнала
         cur = self.obs.get(metric)
         if cur is None or value > cur[0]:
             self.obs[metric] = (float(value), float(threshold), symbol)

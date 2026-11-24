@@ -391,6 +391,13 @@ def main(argv=None) -> None:
     sr.add_argument("--state-dir", default="state/replay")
     sr.set_defaults(func=cmd_shadow_replay)
 
+    sl = sub.add_parser("shadow-lab", help="что улучшить в теневом боте (по state/research/)")
+    sl.add_argument("--bot", required=True, help="ключ бота: oi, fade, vwap, …")
+    sl.add_argument("--days", type=float, default=3.0)
+    sl.add_argument("--state-dir", default="state")
+    sl.set_defaults(func=lambda a: print(__import__("bot.shadow.lab", fromlist=["report"])
+                                         .report(a.state_dir, a.bot, a.days)))
+
     sc = sub.add_parser("shadow-calib", help="как близко теневые боты подходят к порогам входа")
     sc.add_argument("--days", type=float, default=3.0, help="за сколько последних дней")
     sc.add_argument("--state-dir", default="state")

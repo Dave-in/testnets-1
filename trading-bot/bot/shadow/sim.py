@@ -69,6 +69,8 @@ class Position:
     margin: float = 0.0        # изолированная маржа позиции (0 — счёт без модели маржи)
     liq_price: float = 0.0     # цена ликвидации позиции при этой марже
     tag: str = ""              # метка стратегии (например, пара парного арбитража)
+    risk_usd: float = 0.0      # сколько стоил бы стоп при входе (1R)
+    features: dict = field(default_factory=dict)   # признаки сигнала и рынка на входе
 
 
 @dataclass
@@ -91,6 +93,10 @@ class FillReport:
     funding: float | None = None   # закрытие: фандинг за время сделки (+ — заплатили)
     entry_maker: bool = False
     entry_fee_rate: float = 0.0
+    opened: int = 0                # закрытие: когда открыта позиция (мс)
+    entry: float = 0.0             # закрытие: цена входа
+    risk_usd: float = 0.0          # закрытие: 1R — стоимость стопа при входе
+    features: dict | None = None   # закрытие: признаки на входе
 
 
 class Account:
@@ -228,7 +234,8 @@ class Account:
             pos = Position(o.symbol, sign, qty, price, now, reason=m.get("reason", ""),
                            time_stop=now + int(m.get("time_stop_s", 0) * 1000) if m.get("time_stop_s") else 0,
                            trail=m.get("trail", 0.0), best=price, fees=fee, slippage_bps=slip,
-                           entry_maker=maker, tag=m.get("tag", ""))
+                           entry_maker=maker, tag=m.get("tag", ""),
+                           risk_usd=m.get("sl_dist", 0.0) * qty, features=dict(m.get("features", {})))
             if self.leverage:                     # изолированная маржа, как на Bybit
                 pos.margin = price * qty / self.leverage
                 pos.liq_price = self.liquidation_price(sign, price)
@@ -278,7 +285,8 @@ class Account:
                                       fee_rate=rate, gross=pnl_gross, trade_fees=pos.fees,
                                       funding=pos.funding, entry_maker=pos.entry_maker,
                                       entry_fee_rate=self.maker_fee if pos.entry_maker
-                                      else self.taker_fee))
+                                      else self.taker_fee, opened=pos.opened, entry=pos.entry,
+                                      risk_usd=pos.risk_usd, features=pos.features))
 
     def close(self, symbol: str, book, now: int, purpose: str) -> None:
         pos = self.positions.get(symbol)

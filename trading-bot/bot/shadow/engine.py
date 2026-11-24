@@ -14,6 +14,7 @@ from pathlib import Path
 from .. import messages
 from .market import SymbolMarket
 from .sim import Account, Order, round_to_tick
+from .research import Recorder, market_context
 from .strategies import STRATEGIES, PairSignal
 
 log = logging.getLogger(__name__)
@@ -95,6 +96,9 @@ class Engine:
         self.now = 0
         self.next_sec = 0
         self.save_every_s = int(cfg.get("save_every_s", 60))
+        # данные для улучшения ботов (state/research/): сигналы, сделки, путь цены
+        self.research = Recorder(self.state_dir) if cfg.get("research", True) else None
+        self._status = ""
 
     # --- данные ---------------------------------------------------------------------
     def add_market(self, symbol: str, book=None) -> SymbolMarket:
@@ -169,18 +173,36 @@ class Engine:
                     if not m.tradable or (allowed is not None and sym not in allowed) \
                             or acc.busy(sym, now):
                         continue
+                    bot.strategy.cur = {}
                     try:
                         sig = bot.strategy.check(m, now, self.markets)
                     except Exception:  # noqa: BLE001 — ошибка в одной монете не валит остальное
                         log.exception("[%s] ошибка стратегии на %s", bot.key, sym)
                         continue
+                    if sig is None:
+                        continue
                     if isinstance(sig, PairSignal):
                         self._enter_pair(bot, sig, now, allowed)
-                    elif sig is not None:
+                        first = sig.legs[0][1]
+                        first.reason = first.reason or sig.reason
+                        sig = first
+                    else:
                         self._enter(bot, m, sig, now)
+                    if self.research is not None:
+                        try:
+                            self.research.on_signal(bot.key, m, sig, self._status,
+                                                    {**bot.strategy.cur, **sig.features},
+                                                    self.markets, now)
+                        except Exception:  # noqa: BLE001
+                            log.exception("[%s] ошибка записи сигнала", bot.key)
             self._drain(bot)
             if sec % self.save_every_s == 0:
                 self.refresh(bot)
+        if self.research is not None:
+            try:
+                self.research.tick(self.markets, now)
+            except Exception:  # noqa: BLE001
+                log.exception("Ошибка записи данных для анализа")
         if sec % 60 == 0:
             try:
                 self._calibration(sec)
@@ -215,6 +237,7 @@ class Engine:
         acc, price = bot.account, m.price()
         prices = {s: mk.price() for s, mk in self.markets.items()}
         if sig.sl_dist <= 0 or not price:
+            self._status = "нет цены или стопа"
             return False
         # Слишком близкий стоп расширяем до min_stop_pct: позиция станет меньше, риск на сделку
         # тот же, а комиссия — меньшая доля риска.
@@ -223,6 +246,7 @@ class Engine:
         trail = max(sig.trail, floor) if sig.trail else 0.0
         qty = self._size(bot, m, sig, sl_dist, prices, notional)
         if qty <= 0:
+            self._status = "размер: пределы плеча, маржа или минимум биржи"
             return False
         # Сигналы, где тейк меньше min_reward_cost издержек сделки, пропускаем: на них комиссии
         # и проскальзывание съедают всё. Издержки — по текущему стакану для этого объёма.
@@ -231,10 +255,14 @@ class Engine:
             ratio = (sig.tp_dist / price) / cost if cost > 0 else math.inf
             bot.strategy.observe("тейк / издержки сделки", ratio, bot.min_reward_cost, m.symbol)
             if ratio < bot.min_reward_cost:
+                self._status = "издержки: тейк меньше порога"
                 return False
+        features = {"signal": {k: round(v, 6) for k, v in {**bot.strategy.cur, **sig.features}.items()}}
+        if self.research is not None:
+            features["market"] = market_context(m, self.markets, now)
         meta = {"sl_dist": sl_dist, "tp_dist": sig.tp_dist, "time_stop_s": sig.time_stop_s,
                 "trail": trail, "reason": sig.reason, "mid0": m.book.mid() or price,
-                "tick": m.tick, "tag": tag}
+                "tick": m.tick, "tag": tag, "features": features}
         side = "buy" if sig.side > 0 else "sell"
         if sig.entry == "limit":
             limit = round_to_tick(sig.limit_price, m.tick, up=sig.side < 0)
@@ -243,12 +271,14 @@ class Engine:
         else:
             o = Order(m.symbol, side, "market", qty, meta=meta)
         acc.submit(o, m.book, now)
+        self._status = "вход"
         return True
 
     def _enter_pair(self, bot: ShadowBot, ps, now: int, allowed) -> None:
         """Сделка из двух ног (парный арбитраж): обе ноги или ни одной. Размер первой ноги —
         из риска на сделку, второй — сумма первой × β (нейтрально к общему движению рынка)."""
         acc = bot.account
+        self._status = "пара: нет места для двух ног или нога занята"
         if len(acc.positions) + len(acc.pending_entries()) + 2 > bot.max_positions:
             return
         legs = []
@@ -265,6 +295,7 @@ class Engine:
         n2 = n1 * abs(ps.ratio)
         if self._size(bot, m1, s1, s1.sl_dist, prices, n1) <= 0 or \
                 self._size(bot, m2, s2, s2.sl_dist, prices, n2) <= 0:
+            self._status = "размер: пределы плеча, маржа или минимум биржи"
             return
         if self._enter(bot, m1, s1, now, n1, ps.tag, check_cost=False):
             self._enter(bot, m2, s2, now, n2, ps.tag, check_cost=False)
@@ -334,6 +365,12 @@ class Engine:
                 if new:
                     w.writeheader()
                 w.writerow(row)
+            if ev.action == "close" and self.research is not None and ev.symbol in self.markets:
+                try:
+                    self.research.on_close(bot.key, ev, self.markets[ev.symbol], self.markets,
+                                           self.now)
+                except Exception:  # noqa: BLE001
+                    log.exception("[%s] ошибка записи сделки для анализа", bot.key)
             if self.notify_trades and bot.notifier is not None:
                 summary = self.account_summary(bot)
                 if ev.action == "open" and summary["equity"] > 0:
