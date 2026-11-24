@@ -245,19 +245,31 @@ def shadow_trade(ev, title: str = "", summary: dict | None = None) -> str:
     title — название бота; summary — баланс и статистика счёта после сделки."""
     side = "ЛОНГ" if ev.side > 0 else "ШОРТ"
     lines = [f"🤖 <b>{escape(title)}</b>"] if title else []
+
+    def kind(maker: bool, rate: float) -> str:
+        return f"{'мейкер, лимитка' if maker else 'тейкер, по рынку'} {rate * 100:.3g}%"
+
     if ev.action == "open":
         lines += [f"{'🟢' if ev.side > 0 else '🔴'} <b>ОТКРЫТЬ {side} {escape(ev.symbol)}</b>",
                   f"Цена: {price(ev.price)} (проскальзывание {ev.slippage_bps:+.1f} б.п.)",
                   f"Сумма: {money(ev.price * ev.qty)} USDT",
+                  f"Комиссия Bybit: {ev.fee:.4f} USDT ({kind(ev.maker, ev.fee_rate)})",
                   f"Причина: {escape(ev.reason)}"]
     else:
         why = {"tp": "тейк", "sl": "стоп", "time": "время вышло", "manual": "команда",
                "liquidation": "ликвидация"}.get(ev.reason, ev.reason)
         icon = "✅" if (ev.pnl or 0) >= 0 else "❌"
         lines += [f"⚪️ <b>ЗАКРЫТЬ {side} {escape(ev.symbol)}</b> — {why}",
-                  f"Цена: {price(ev.price)}",
-                  f"{icon} Итог сделки: {signed(ev.pnl or 0.0)} USDT "
-                  f"({pct(ev.ret or 0.0)} к сумме позиции, с комиссиями)"]
+                  f"Цена: {price(ev.price)} (проскальзывание {ev.slippage_bps:+.1f} б.п.)"]
+        if ev.gross is not None:
+            lines += [f"До комиссий: {signed(ev.gross)} USDT",
+                      f"Комиссии Bybit: −{(ev.trade_fees or 0.0):.4f} USDT "
+                      f"(вход: {kind(ev.entry_maker, ev.entry_fee_rate)}; "
+                      f"выход: {kind(ev.maker, ev.fee_rate)})"]
+            if ev.funding:
+                lines.append(f"Фандинг: {signed(-ev.funding)} USDT")
+        lines.append(f"{icon} Итог сделки: {signed(ev.pnl or 0.0)} USDT "
+                     f"({pct(ev.ret or 0.0)} к сумме позиции, после комиссий и фандинга)")
     if summary:
         s = summary
         total = s["equity"] / s["start"] - 1 if s["start"] else 0.0

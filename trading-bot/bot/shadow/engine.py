@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .. import messages
 from .market import SymbolMarket
-from .sim import Account, Order
+from .sim import Account, Order, round_to_tick
 from .strategies import STRATEGIES
 
 log = logging.getLogger(__name__)
@@ -47,6 +47,7 @@ class ShadowBot:
         self.state_path = Path(state_dir) / f"shadow_{key}.json"
         self.control_path = Path(state_dir) / f"shadow_{key}_control.json"
         self.journal_path = Path(state_dir) / f"shadow_{key}_trades.csv"
+        self.journal_checked = False
         self.notifier = notifier
         self.paused = False
         self.stop_requested = False
@@ -172,13 +173,20 @@ class Engine:
         qty = bot.risk * equity / sl_dist                         # стоп = risk·капитала
         room = bot.max_leverage * equity - acc.committed(prices)
         qty = min(qty, max(room, 0.0) / price, bot.max_position_leverage * equity / price)
-        if qty * price < bot.min_notional:
+        # правила контракта Bybit: предел рыночного ордера, шаг объёма (вниз), минимумы
+        if m.max_mkt_qty and sig.entry != "limit":
+            qty = min(qty, m.max_mkt_qty)
+        if m.qty_step:
+            qty = math.floor(qty / m.qty_step + 1e-9) * m.qty_step
+        if qty <= 0 or qty < m.min_qty or qty * price < max(bot.min_notional, m.min_notional):
             return
         meta = {"sl_dist": sl_dist, "tp_dist": sig.tp_dist, "time_stop_s": sig.time_stop_s,
-                "trail": trail, "reason": sig.reason, "mid0": m.book.mid() or price}
+                "trail": trail, "reason": sig.reason, "mid0": m.book.mid() or price,
+                "tick": m.tick}
         side = "buy" if sig.side > 0 else "sell"
         if sig.entry == "limit":
-            o = Order(m.symbol, side, "limit", qty, sig.limit_price, "entry",
+            limit = round_to_tick(sig.limit_price, m.tick, up=sig.side < 0)
+            o = Order(m.symbol, side, "limit", qty, limit, "entry",
                       expire=now + sig.limit_ttl_s * 1000, meta=meta)
         else:
             o = Order(m.symbol, side, "market", qty, meta=meta)
@@ -190,8 +198,22 @@ class Engine:
                    "side": "long" if ev.side > 0 else "short", "qty": round(ev.qty, 8),
                    "price": ev.price, "fee": round(ev.fee, 6), "reason": ev.reason,
                    "slippage_bps": round(ev.slippage_bps, 2),
-                   "pnl": "" if ev.pnl is None else round(ev.pnl, 6)}
+                   "pnl": "" if ev.pnl is None else round(ev.pnl, 6),
+                   "fee_type": "maker" if ev.maker else "taker",
+                   "fee_rate_pct": round(ev.fee_rate * 100, 4),
+                   "gross": "" if ev.gross is None else round(ev.gross, 6),
+                   "trade_fees": "" if ev.trade_fees is None else round(ev.trade_fees, 6),
+                   "funding": "" if ev.funding is None else round(ev.funding, 6)}
             new = not bot.journal_path.exists()
+            if not new and not bot.journal_checked:
+                # журнал от прежней версии с другими колонками — откладываем в сторону
+                with bot.journal_path.open(encoding="utf-8") as f:
+                    header = f.readline().strip()
+                if header != ",".join(row):
+                    bot.journal_path.replace(bot.journal_path.with_name(
+                        bot.journal_path.stem + "_old.csv"))
+                    new = True
+            bot.journal_checked = True
             with bot.journal_path.open("a", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=list(row))
                 if new:

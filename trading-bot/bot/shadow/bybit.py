@@ -99,10 +99,26 @@ def select_universe(cfg: dict) -> list[str]:
     return chosen
 
 
+def apply_instrument(m, info: dict) -> None:
+    """Правила контракта Bybit: шаг объёма, минимальный объём и сумма, шаг цены."""
+    lot, pf = info.get("lotSizeFilter", {}), info.get("priceFilter", {})
+    m.qty_step = float(lot.get("qtyStep") or 0)
+    m.min_qty = float(lot.get("minOrderQty") or 0)
+    m.max_mkt_qty = float(lot.get("maxMktOrderQty") or 0)
+    m.min_notional = float(lot.get("minNotionalValue") or 0)
+    m.tick = float(pf.get("tickSize") or 0)
+
+
 def warmup(engine: Engine, symbols: list[str]) -> None:
-    """Минутные свечи за последние ~8 часов и текущие тикеры — чтобы сразу была волатильность."""
+    """Правила контрактов, минутные свечи за ~8 часов и тикеры — чтобы сразу была волатильность."""
     for s in symbols:
         m = engine.add_market(s)
+        try:
+            info = _get("/v5/market/instruments-info", {"category": "linear", "symbol": s})["list"]
+            if info:
+                apply_instrument(m, info[0])
+        except Exception as e:  # noqa: BLE001
+            log.warning("Правила контракта %s не получены: %s", s, e)
         try:
             kl = _get("/v5/market/kline", {"category": "linear", "symbol": s, "interval": 1, "limit": 500})
             m.warmup_minutes([float(k[4]) for k in reversed(kl["list"])])

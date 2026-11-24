@@ -33,6 +33,12 @@ class SymbolMarket:
         self.next_funding = 0                 # мс
         self.mark_price = 0.0
         self.turnover24h = 0.0
+        # правила контракта Bybit (0 — не ограничено): шаг объёма, минимум, шаг цены и т.д.
+        self.qty_step = 0.0
+        self.min_qty = 0.0
+        self.max_mkt_qty = 0.0
+        self.min_notional = 0.0
+        self.tick = 0.0
         self._sigma_cache: tuple[int, float] = (-1, 0.0)
 
     # --- поступление данных ----------------------------------------------------

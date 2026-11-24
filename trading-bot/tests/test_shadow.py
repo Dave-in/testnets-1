@@ -62,11 +62,14 @@ def test_limit_order_waits_for_queue_then_fills_as_maker():
     ob = book(100.0)
     acc = Account("t", 100.0)
     o = acc.submit(Order("X", "buy", "limit", 1.0, 99.95, "entry", meta={"sl_dist": 1.0}), ob, T0)
-    assert o.queue_ahead == 10.0                          # впереди 10 монет
-    acc.on_trade("X", 99.95, 5.0, taker_buy=False, book=ob, now=T0 + 1)
-    acc.on_trade("X", 100.05, 50.0, taker_buy=True, book=ob, now=T0 + 2)   # покупки нас не касаются
+    acc.on_trade("X", 99.90, 50.0, taker_buy=False, book=ob, now=T0 + 100)  # ордер ещё в пути
+    assert "X" not in acc.positions and not o.queued
+    acc.process({"X": ob}, T0 + 250)                     # дошёл до биржи: встал за 10 монетами
+    assert o.queue_ahead == 10.0
+    acc.on_trade("X", 99.95, 5.0, taker_buy=False, book=ob, now=T0 + 301)
+    acc.on_trade("X", 100.05, 50.0, taker_buy=True, book=ob, now=T0 + 302)  # покупки нас не касаются
     assert "X" not in acc.positions
-    acc.on_trade("X", 99.95, 6.0, taker_buy=False, book=ob, now=T0 + 3)    # очередь 10 + наш 1 пройдены
+    acc.on_trade("X", 99.95, 6.0, taker_buy=False, book=ob, now=T0 + 303)  # очередь 10 + наш 1 пройдены
     pos = acc.positions["X"]
     assert pos.entry == 99.95 and acc.stats["fees"] == pytest.approx(99.95 * 0.0002)
 
@@ -75,7 +78,7 @@ def test_limit_order_fills_when_price_trades_through():
     ob = book(100.0)
     acc = Account("t", 100.0)
     acc.submit(Order("X", "sell", "limit", 1.0, 100.05, "entry", meta={"sl_dist": 1.0}), ob, T0)
-    acc.on_trade("X", 100.15, 0.1, taker_buy=True, book=ob, now=T0 + 1)
+    acc.on_trade("X", 100.15, 0.1, taker_buy=True, book=ob, now=T0 + 300)
     assert acc.positions["X"].side == -1
 
 
@@ -616,3 +619,67 @@ def test_engine_sends_every_open_and_close_with_balance(tmp_path):
     assert len(trades) == 2 and "ОТКРЫТЬ ЛОНГ" in trades[0] and "ЗАКРЫТЬ ЛОНГ" in trades[1]
     assert all(bot.title in t and "Баланс" in t and "Сделок:" in t for t in trades)
     assert "Сделок: 1" in trades[1]
+
+
+# --- реалистичность: правила контракта Bybit, задержка ордеров, комиссии в сообщениях -----
+
+def test_entry_respects_bybit_lot_step_min_qty_and_tick(tmp_path):
+    eng = Engine(shadow_cfg(), tmp_path)
+    m = eng.add_market("PEPEUSDT", book(0.01, step=0.000001, size=1e9))
+    m.last_price = 0.01
+    m.qty_step, m.min_qty, m.tick, m.min_notional = 100.0, 100.0, 0.000001, 5.0
+    bot = eng.bots["fade"]
+    eng._enter(bot, m, S.Signal(-1, sl_dist=0.0001, tp_dist=0.001, entry="limit",
+                                limit_price=0.0100004), T0)
+    o = bot.account.orders[0]
+    assert o.qty % 100 == 0 and o.qty > 0                   # объём кратен шагу Bybit
+    assert o.price == pytest.approx(0.010001)               # продажа: цена вверх до шага
+    m2 = eng.add_market("BIGUSDT", book(1000.0))
+    m2.qty_step, m2.min_qty = 1.0, 1.0                       # 1 монета = 1000 $ > 3 размеров счёта
+    eng._enter(bot, m2, S.Signal(1, sl_dist=5.0, tp_dist=50.0), T0)
+    assert all(o.symbol != "BIGUSDT" for o in bot.account.orders)   # меньше минимума — пропуск
+
+
+def test_protective_orders_rounded_and_delayed():
+    ob = book(100.0, 0.1, 10.0, levels=50)
+    acc = Account("t", 1000.0, latency_ms=250)
+    acc.submit(Order("X", "buy", "market", 1.0, meta={"sl_dist": 0.333, "tp_dist": 0.777,
+                                                       "mid0": 100.0, "tick": 0.1}), ob, T0)
+    acc.process({"X": ob}, T0 + 250)
+    pos = acc.positions["X"]
+    sl = next(o for o in acc.orders if o.purpose == "sl")
+    tp = next(o for o in acc.orders if o.purpose == "tp")
+    assert round(sl.price * 10, 6) == int(round(sl.price * 10, 6)) and sl.price <= pos.entry - 0.333
+    assert round(tp.price * 10, 6) == int(round(tp.price * 10, 6)) and tp.price >= pos.entry + 0.777
+    acc.on_trade("X", sl.price - 1, 1.0, taker_buy=False, book=ob, now=T0 + 300)   # стоп ещё в пути
+    assert not any(o.kind == "market" for o in acc.orders)
+    acc.on_trade("X", sl.price - 1, 1.0, taker_buy=False, book=ob, now=T0 + 600)   # уже на бирже
+    assert any(o.kind == "market" and o.purpose == "sl" for o in acc.orders)
+
+
+def test_trade_messages_show_bybit_fees_and_breakdown(tmp_path):
+    ob = book(100.0, 0.1, 10.0, levels=50)
+    acc = Account("t", 1000.0)
+    acc.submit(Order("X", "buy", "market", 1.0, meta={"sl_dist": 1.0, "tp_dist": 1.0, "mid0": 100.0}),
+               ob, T0)
+    acc.process({"X": ob}, T0 + 300)
+    tp = acc.positions["X"].tp
+    acc.on_trade("X", tp + 0.2, 1.0, taker_buy=True, book=ob, now=T0 + 1000)
+    opened, closed = acc.events
+    o_text, c_text = messages.shadow_trade(opened), messages.shadow_trade(closed)
+    assert "Комиссия Bybit: 0.0550 USDT (тейкер, по рынку 0.055%)" in o_text
+    assert "До комиссий" in c_text and "вход: тейкер" in c_text and "выход: мейкер, лимитка 0.02%" in c_text
+    assert closed.gross - closed.trade_fees - closed.funding == pytest.approx(closed.pnl)
+    assert closed.trade_fees == pytest.approx(acc.stats["fees"])
+
+
+def test_old_journal_with_other_columns_is_set_aside(tmp_path):
+    eng = Engine(shadow_cfg(), tmp_path)
+    bot = eng.bots["fade"]
+    bot.journal_path.write_text("ts,symbol,action\nold,row,x\n", encoding="utf-8")
+    m = eng.add_market("ETHUSDT", book(100.0))
+    eng._enter(bot, m, S.Signal(1, sl_dist=1.0, tp_dist=2.0), T0)
+    eng.advance(T0 + 1000)
+    assert (tmp_path / "shadow_fade_trades_old.csv").exists()
+    head = bot.journal_path.read_text(encoding="utf-8").splitlines()[0]
+    assert head.endswith("fee_type,fee_rate_pct,gross,trade_fees,funding")
