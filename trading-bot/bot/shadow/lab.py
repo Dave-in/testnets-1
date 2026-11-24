@@ -101,6 +101,35 @@ def grid(signals: list[dict]) -> list[tuple]:
     return sorted(res, reverse=True)
 
 
+def telegram(state_dir: str | Path, args: list[str]) -> str:
+    """/lab — список ботов и объём данных; /lab <бот> [дней] — отчёт лаборатории."""
+    from .. import messages
+    from .strategies import STRATEGIES
+    d = Path(state_dir) / "research"
+
+    def count(kind, key):
+        p = d / f"{kind}_{key}.jsonl"
+        return sum(1 for _ in p.open(encoding="utf-8")) if p.exists() else 0
+
+    if not args or args[0].lower() not in STRATEGIES:
+        lines = ["🧪 <b>Лаборатория</b>: что улучшить в боте — стоп тесный или вход плохой, какие "
+                 "признаки отличают прибыльные сделки, какие стоп/тейк/время дали бы лучше результат.",
+                 "Команда: <code>/lab ключ [дней]</code>, например <code>/lab oi</code> или "
+                 "<code>/lab vwap 7</code>. Данные появляются через час после сигнала.", ""]
+        for key, cls in STRATEGIES.items():
+            lines.append(f"<code>{key}</code> — {messages.escape(cls.title)}: сделок {count('trades', key)}, "
+                         f"сигналов {count('signals', key)}")
+        return "\n".join(lines)
+    key = args[0].lower()
+    try:
+        days = float(args[1].replace(",", ".")) if len(args) > 1 else 3.0
+    except ValueError:
+        days = 3.0
+    title = STRATEGIES[key].title
+    body = report(state_dir, key, days).replace(f"бот «{key}»", f"бот «{title}»", 1)
+    return "🧪 " + messages.escape(body)
+
+
 def report(state_dir: str | Path, bot: str, days: float = 3.0) -> str:
     d = Path(state_dir) / "research"
     trades = load(d / f"trades_{bot}.jsonl", days, "closed")

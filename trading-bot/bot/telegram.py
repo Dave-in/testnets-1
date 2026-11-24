@@ -286,7 +286,7 @@ class CommandListener(threading.Thread):
     Состояние берёт из JSON-файла бота, а команды управления кладёт в control-файл —
     то есть с торговым циклом общается только через файлы, без общей памяти."""
 
-    GROUP_COMMANDS = ("/status", "/report", "/calib", "/daily", "/help", "/start")   # просмотр
+    GROUP_COMMANDS = ("/status", "/report", "/calib", "/daily", "/lab", "/help", "/start")
 
     def __init__(self, tg: Telegram, state_path: Path | None = None,
                  control_path: Path | None = None, bots: list[tuple] | None = None,
@@ -331,6 +331,11 @@ class CommandListener(threading.Thread):
             return "\n\n".join(
                 (f"<b>[{messages.escape(n)}]</b>\n" if many else "") + messages.status_text(s)
                 for n, s in snaps)
+        if cmd == "/lab":
+            if self.calib_path is None:
+                return "Лаборатория есть только у теневых ботов, а они не запущены."
+            from .shadow import lab
+            return lab.telegram(self.calib_path.parent, text.split()[1:])
         if cmd == "/daily":
             if self.calib_path is None:
                 return "Отчёт за день есть только у теневых ботов, а они не запущены."

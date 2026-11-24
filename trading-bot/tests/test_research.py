@@ -77,3 +77,20 @@ def test_lab_simulation_and_report(tmp_path):
     assert lab.simulate([0, -0.006, 0.02], 1, 0.5, 1.0, 5) == -0.5 - lab.COST_PCT
     text = lab.report(tmp_path, "oi", 3)
     assert "СИГНАЛЫ" in text and "ПЕРЕБОР" in text and "сила" in text
+
+
+def test_lab_telegram_command(tmp_path):
+    from bot.telegram import CommandListener, Telegram
+    d = tmp_path / "research"
+    d.mkdir()
+    (d / "trades_oi.jsonl").write_text(json.dumps({
+        "closed": "2026-11-24T10:00:00+00:00", "pnl": -1.0, "r_multiple": -1.0, "exit_reason": "sl",
+        "hold_s": 120, "mfe_r": 0.6, "features": {}}) + "\n", encoding="utf-8")
+    lst = CommandListener(Telegram("T", 111, lambda *a: {"ok": True}),
+                          bots=[("x", tmp_path / "s.json", tmp_path / "c.json")],
+                          calib_path=tmp_path / "shadow_calibration.csv")
+    listing = lst.handle("/lab")
+    assert "<code>oi</code> — Открытый интерес: сделок 1" in listing
+    text = lst.handle("/lab oi 2")
+    assert "бот «Открытый интерес»" in text and "СДЕЛКИ" in text and "<" not in text.replace("&lt;", "")
+    assert "Лаборатория" in lst.handle("/lab нет_такого")
