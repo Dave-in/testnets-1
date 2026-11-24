@@ -41,9 +41,24 @@ class Strategy:
             raise ValueError(f"{self.key}: неизвестные параметры {sorted(unknown)}")
         self.p = {**self.defaults, **params}
         self.state: dict = {}
+        self.obs: dict = {}
 
     def check(self, m, now: int, markets: dict) -> Signal | None:  # pragma: no cover
         raise NotImplementedError
+
+    # --- калибровка: «почти сработавшие» сигналы ------------------------------------------
+    def observe(self, metric: str, value: float, threshold: float, symbol: str) -> None:
+        """Запомнить значение условия входа. За минуту хранится максимум по всем монетам —
+        по этим максимумам видно, как близко бот подходит к порогу и где порог поставить."""
+        if value is None or not math.isfinite(value):
+            return
+        cur = self.obs.get(metric)
+        if cur is None or value > cur[0]:
+            self.obs[metric] = (float(value), float(threshold), symbol)
+
+    def take_observations(self) -> dict:
+        out, self.obs = self.obs, {}
+        return out
 
 
 class LiquidationCascade(Strategy):
@@ -51,7 +66,7 @@ class LiquidationCascade(Strategy):
     idea = ("Каскад принудительных закрытий толкает цену дальше «справедливой». Когда каскад "
             "иссяк — ликвидаций нет и цена перестала обновлять экстремум — входим против "
             "движения и ждём частичного возврата.")
-    defaults = {"window_s": 60, "mult": 8.0, "min_usd": 50_000.0, "move_sigma": 2.5,
+    defaults = {"window_s": 60, "mult": 5.0, "min_usd": 20_000.0, "move_sigma": 2.5,
                 "quiet_s": 15, "wait_s": 180, "retrace": 0.5, "sl_frac": 0.3, "time_stop_s": 900}
 
     def check(self, m, now, markets):
@@ -63,7 +78,10 @@ class LiquidationCascade(Strategy):
             liq = m.liq_sum(p["window_s"], now)
             need = max(p["mult"] * m.liq_baseline() * p["window_s"] / 60, p["min_usd"])
             r = m.ret(p["window_s"])
-            if liq >= need and abs(r) >= p["move_sigma"] * s1 * math.sqrt(p["window_s"] / 60):
+            move = abs(r) / (s1 * math.sqrt(p["window_s"] / 60))
+            self.observe("ликвидации за окно ($)", liq, need, m.symbol)
+            self.observe("ход цены (σ)", move, p["move_sigma"], m.symbol)
+            if liq >= need and move >= p["move_sigma"]:
                 self.state[m.symbol] = {"t": now, "dir": _sign(r), "start": m.price_ago(p["window_s"])}
             return None
         elapsed = (now - st["t"]) // 1000
@@ -92,30 +110,36 @@ class BookImbalance(Strategy):
     key, title = "book", "Стакан"
     idea = ("Если в лучших уровнях стакана покупателей заметно больше, чем продавцов, "
             "и агрессивные сделки идут в ту же сторону, ближайшее движение вероятнее в эту "
-            "сторону. Входим лимитным ордером (дешёвая комиссия), держим до 5 минут.")
-    defaults = {"levels": 10, "obi": 0.5, "persist_s": 5, "micro": 0.2, "flow_s": 30, "flow": 0.2,
-                "tp_sigma": 1.0, "sl_sigma": 1.0, "ttl_s": 15, "time_stop_s": 300}
+            "сторону. Перекос живёт секунды, поэтому горизонт короткий — до минуты, и смотрим "
+            "только 3 лучших уровня (глубже стакан легко заспуфить). Входим лимиткой.")
+    defaults = {"levels": 3, "obi": 0.5, "persist_s": 5, "micro": 0.2, "flow_s": 30, "flow": 0.2,
+                "horizon_s": 60, "tp_sigma": 1.0, "sl_sigma": 1.0, "ttl_s": 15, "time_stop_s": 60}
 
     def check(self, m, now, markets):
         p, book = self.p, m.book
         if not book.ready or not m.sigma1m():
             return None
         obi = book.imbalance(p["levels"])
+        self.observe("перекос стакана", abs(obi), p["obi"], m.symbol)
         d = _sign(obi) if abs(obi) >= p["obi"] else 0
         prev = self.state.get(m.symbol, (0, 0))
         streak = prev[1] + 1 if d and d == prev[0] else (1 if d else 0)
         self.state[m.symbol] = (d, streak)
+        self.observe("перекос держится (с)", streak, p["persist_s"], m.symbol)
         if streak < p["persist_s"]:
             return None
         spread = book.spread()
         if not getattr(book, "approx", False):     # в повторе истории микроцены нет
             micro = (book.microprice() - book.mid()) / spread if spread > 0 else 0.0
+            self.observe("микроцена (доля спреда)", d * micro, p["micro"], m.symbol)
             if d * micro < p["micro"]:
                 return None
-        if d * m.flow(p["flow_s"], now) < p["flow"]:
+        flow = d * m.flow(p["flow_s"], now)
+        self.observe("поток сделок", flow, p["flow"], m.symbol)
+        if flow < p["flow"]:
             return None
         self.state[m.symbol] = (0, 0)
-        s5 = m.sigma1m() * math.sqrt(5) * m.price()
+        s5 = m.sigma1m() * math.sqrt(p["horizon_s"] / 60) * m.price()
         limit = book.best_bid() if d > 0 else book.best_ask()
         return Signal(d, p["sl_sigma"] * s5, p["tp_sigma"] * s5, entry="limit", limit_price=limit,
                       limit_ttl_s=p["ttl_s"], time_stop_s=p["time_stop_s"],
@@ -153,14 +177,18 @@ class LeadLag(Strategy):
         if not sb or not sa or not price:
             return None
         rb = ref.ret(p["window_s"])
-        if abs(rb) < p["z"] * sb * math.sqrt(p["window_s"] / 60):
+        zb = abs(rb) / (sb * math.sqrt(p["window_s"] / 60))
+        self.observe("ход BTC (σ)", zb, p["z"], ref.symbol)
+        if zb < p["z"]:
             return None
         beta = self._beta(m, ref)
         if beta < p["min_beta"]:
             return None
         expected = beta * rb
         gap = expected - m.ret(p["window_s"])
-        if _sign(gap) != _sign(rb) or abs(gap) < p["gap"] * abs(expected):
+        lag = gap / expected if expected else 0.0     # доля ожидаемого хода, которую альт не прошёл
+        self.observe("отставание (доля хода)", lag, p["gap"], m.symbol)
+        if lag < p["gap"]:
             return None
         d = _sign(rb)
         tp = price * (math.exp(abs(gap) * p["tp_frac"]) - 1)
@@ -181,10 +209,13 @@ class OpenInterestFlow(Strategy):
         if not s1 or not price:
             return None
         doi = m.oi_change(p["window_s"], now)
-        if doi is None or doi < p["oi_min"]:
-            return None
         r = m.ret(p["window_s"])
-        if abs(r) < p["z"] * s1 * math.sqrt(p["window_s"] / 60):
+        z = abs(r) / (s1 * math.sqrt(p["window_s"] / 60))
+        self.observe("ход цены (σ)", z, p["z"], m.symbol)
+        if doi is None:
+            return None
+        self.observe("рост открытого интереса", doi, p["oi_min"], m.symbol)
+        if doi < p["oi_min"] or z < p["z"]:
             return None
         trail = p["trail_sigma"] * s1 * math.sqrt(5) * price
         return Signal(_sign(r), trail, trail=trail, time_stop_s=p["time_stop_s"],
@@ -196,14 +227,18 @@ class FundingSkew(Strategy):
     key, title = "fund", "Фандинг"
     idea = ("Очень высокая ставка фандинга значит, что рынок перекошен в одну сторону (все в "
             "лонгах или все в шортах). Когда цена начинает идти против толпы, входим вместе с "
-            "этим движением и вдобавок получаем фандинг.")
+            "этим движением и вдобавок получаем фандинг. Ставку сравниваем, приведя к 8 часам: "
+            "у части монет фандинг раз в 1 или 4 часа.")
     defaults = {"rate": 0.0005, "window_s": 900, "sl_sigma": 2.0, "tp_sigma": 3.0,
                 "time_stop_s": 4 * 3600}
 
     def check(self, m, now, markets):
         p, s1, price = self.p, m.sigma1m(), m.price()
-        fr = m.funding_rate
-        if not s1 or not price or abs(fr) < p["rate"]:
+        if not s1 or not price:
+            return None
+        fr = m.funding_rate * 8 / (m.funding_interval_h or 8)   # ставка за 8 часов
+        self.observe("фандинг за 8 ч", abs(fr), p["rate"], m.symbol)
+        if abs(fr) < p["rate"]:
             return None
         d = -_sign(fr)                               # против толпы
         vwap = m.vwap(p["window_s"], now)
@@ -211,7 +246,7 @@ class FundingSkew(Strategy):
             return None
         s15 = s1 * math.sqrt(p["window_s"] / 60) * price
         return Signal(d, p["sl_sigma"] * s15, p["tp_sigma"] * s15, time_stop_s=p["time_stop_s"],
-                      reason=f"фандинг {fr * 100:+.3f}% за период, цена пошла против толпы")
+                      reason=f"фандинг {fr * 100:+.3f}% за 8 ч, цена пошла против толпы")
 
 
 class FadeSpike(Strategy):
@@ -227,7 +262,9 @@ class FadeSpike(Strategy):
         if not s1 or not price:
             return None
         r = m.ret(p["window_s"])
-        if abs(r) < p["z"] * s1 * math.sqrt(p["window_s"] / 60):
+        z = abs(r) / (s1 * math.sqrt(p["window_s"] / 60))
+        self.observe("ход цены (σ)", z, p["z"], m.symbol)
+        if z < p["z"]:
             return None
         d = _sign(r)
         ext, recent = m.extreme(p["window_s"], d), m.extreme(p["quiet_s"], d)

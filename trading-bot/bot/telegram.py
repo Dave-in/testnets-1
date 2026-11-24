@@ -210,16 +210,18 @@ class CommandListener(threading.Thread):
     Состояние берёт из JSON-файла бота, а команды управления кладёт в control-файл —
     то есть с торговым циклом общается только через файлы, без общей памяти."""
 
-    GROUP_COMMANDS = ("/status", "/report", "/help", "/start")   # в группе — только просмотр
+    GROUP_COMMANDS = ("/status", "/report", "/calib", "/help", "/start")   # в группе — просмотр
 
     def __init__(self, tg: Telegram, state_path: Path | None = None,
                  control_path: Path | None = None, bots: list[tuple] | None = None,
-                 group: ShadowChannel | None = None):
+                 group: ShadowChannel | None = None, calib_path: Path | None = None):
         """bots — список (имя, файл состояния, control-файл); для одного счёта
-        достаточно state_path и control_path. group — группа с темами теневых ботов."""
+        достаточно state_path и control_path. group — группа с темами теневых ботов,
+        calib_path — журнал калибровки теневых ботов (для /calib)."""
         super().__init__(daemon=True, name="telegram-commands")
         self.tg = tg
         self.group = group
+        self.calib_path = calib_path
         self.bots = [(n, Path(s), Path(c)) for n, s, c in (bots or [("", state_path, control_path)])]
         self.stop_event = threading.Event()
 
@@ -253,6 +255,15 @@ class CommandListener(threading.Thread):
             return "\n\n".join(
                 (f"<b>[{messages.escape(n)}]</b>\n" if many else "") + messages.status_text(s)
                 for n, s in snaps)
+        if cmd == "/calib":
+            if self.calib_path is None:
+                return "Калибровка есть только у теневых ботов, а они не запущены."
+            from .shadow.calib import report
+            try:
+                days = float(text.split()[1].replace(",", "."))
+            except (IndexError, ValueError):
+                days = 3.0
+            return report(self.calib_path, days)
         scope = " на всех счетах" if many else ""
         if cmd == "/pause":
             self._control("pause")

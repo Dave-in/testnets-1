@@ -151,7 +151,9 @@ def build_group(path: str | Path, confirm_live: bool = False) -> Group:
     if tg is not None:
         bots = [(n, r.state_path, control_path(r.state_path)) for n, r in runners.items()]
         bots += [(n, b.state_path, b.control_path) for n, b in extra.items()]
-        CommandListener(Telegram(token, chat), bots=bots, group=channel).start()
+        CommandListener(Telegram(token, chat), bots=bots, group=channel,
+                        calib_path=(base / "state" / "shadow_calibration.csv") if extra else None
+                        ).start()
         lines = [f"• <b>{messages.escape(s.name)}</b>: {cfgs[s.name].exchange.market}, "
                  f"монет {len(cfgs[s.name].portfolio.symbols)}, "
                  f"{'сигналы включены' if s.signals else 'без сигналов, только в отчётах'}"

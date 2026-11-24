@@ -683,3 +683,73 @@ def test_old_journal_with_other_columns_is_set_aside(tmp_path):
     assert (tmp_path / "shadow_fade_trades_old.csv").exists()
     head = bot.journal_path.read_text(encoding="utf-8").splitlines()[0]
     assert head.endswith("fee_type,fee_rate_pct,gross,trade_fees,funding")
+
+
+# --- калибровка и правки стратегий по разбору первого часа --------------------------------
+
+def test_funding_rate_is_compared_per_8_hours():
+    def falling():
+        f = market(calm(700) + list(np.linspace(100, 99, 300)))
+        f.trades.extend([(T0 - 1000, 99.8, 1000.0)])
+        return f
+    f8 = falling()
+    f8.funding_rate, f8.funding_interval_h = 0.0001, 8.0                 # 0.01% за 8 ч — обычная
+    assert S.FundingSkew().check(f8, T0, {}) is None
+    f1 = falling()
+    f1.funding_rate, f1.funding_interval_h = 0.0001, 1.0                 # 0.01% в час = 0.08% за 8 ч
+    sig = S.FundingSkew().check(f1, T0, {})
+    assert sig is not None and sig.side == -1 and "0.080% за 8 ч" in sig.reason
+
+
+def test_book_imbalance_uses_top_levels_only():
+    ob = OrderBook()
+    bids = [(99.95 - i * 0.1, 10.0) for i in range(3)] + [(99.65 - i * 0.1, 500.0) for i in range(7)]
+    asks = [(100.05 + i * 0.1, 10.0) for i in range(10)]
+    ob.snapshot(bids, asks, T0)                                         # «стена» глубже 3-го уровня
+    assert abs(ob.imbalance(3)) < 0.01 and ob.imbalance(10) > 0.5
+    m = market(calm(), ob=ob)
+    m.trades.extend([(T0 - 1000, 100.0, 5000.0)])
+    strat = S.BookImbalance()
+    assert all(strat.check(m, T0 + i * 1000, {}) is None for i in range(6))
+
+
+def test_trade_cost_includes_slippage_and_lag_needs_3x(tmp_path):
+    cfg = shadow_cfg(bots=["lag"], lag={"min_reward_cost": 3.0})
+    eng = Engine(cfg, tmp_path)
+    bot = eng.bots["lag"]
+    assert bot.min_reward_cost == 3.0
+    thin = eng.add_market("ALTUSDT", book(100.0, 0.1, 0.2, levels=50))   # тонкий стакан
+    thin.last_price = 100.0
+    sig = S.Signal(1, sl_dist=0.5, tp_dist=0.6)                          # тейк 0.6%
+    cost = eng.trade_cost(bot.account, thin, sig, 1.25)
+    assert cost > 2 * 0.00055 + 0.001                                    # комиссии + заметное проскальзывание
+    eng._enter(bot, thin, sig, T0)
+    assert not bot.account.orders                                        # 0.6% < 3 × издержки
+    obs = bot.strategy.take_observations()
+    assert obs["тейк / издержки сделки"][0] < 3.0
+    deep = eng.add_market("DEEPUSDT", book(100.0, 0.01, 1e6))
+    deep.last_price = 100.0
+    eng._enter(bot, deep, sig, T0)
+    assert bot.account.orders                                            # в глубоком стакане проходит
+
+
+def test_calibration_log_and_report(tmp_path):
+    from bot.shadow.calib import report
+    from bot.telegram import CommandListener, Telegram
+    eng = Engine(shadow_cfg(bots=["fade", "liq"]), tmp_path)
+    m = eng.add_market("ETHUSDT", book(100.0))
+    m.warmup_minutes(list(100 * np.exp(np.cumsum(np.random.default_rng(3).normal(0, 0.001, 300)))))
+    m.on_liquidation(T0 + 5_000, 7_000.0)
+    t = T0 - T0 % 60_000
+    for i, p in enumerate(calm(200) + list(np.linspace(100, 101, 100))):
+        eng.on_trade("ETHUSDT", t + i * 1000, p, 1.0, True)
+    path = tmp_path / "shadow_calibration.csv"
+    rows = path.read_text(encoding="utf-8").splitlines()
+    assert rows[0] == "ts,bot,metric,value,threshold,ratio,symbol"
+    assert any(",liq,ликвидации за окно ($)," in r for r in rows) and any(",fade,ход цены (σ)," in r for r in rows)
+    text = report(path, 3)
+    assert "Ликвидации" in text and "Откат (контроль)" in text and "99%" in text and "порог 20 000" in text
+    lst = CommandListener(Telegram("T", 111, lambda *a: {"ok": True}),
+                          bots=[("x", tmp_path / "s.json", tmp_path / "c.json")], calib_path=path)
+    assert "Калибровка порогов" in lst.handle("/calib 1")
+    assert "пока нет" in report(tmp_path / "нет.csv")

@@ -107,6 +107,8 @@ def apply_instrument(m, info: dict) -> None:
     m.max_mkt_qty = float(lot.get("maxMktOrderQty") or 0)
     m.min_notional = float(lot.get("minNotionalValue") or 0)
     m.tick = float(pf.get("tickSize") or 0)
+    if info.get("fundingInterval"):
+        m.funding_interval_h = float(info["fundingInterval"]) / 60     # Bybit даёт в минутах
 
 
 def warmup(engine: Engine, symbols: list[str]) -> None:

@@ -40,7 +40,10 @@ class ShadowBot:
         self.min_notional = float(acc.get("min_notional", 5.0))
         self.max_position_leverage = float(acc.get("max_position_leverage", 3.0))
         self.min_stop_pct = float(acc.get("min_stop_pct", 0.004))
-        self.min_reward_cost = float(acc.get("min_reward_cost", 2.5))
+        # тейк во столько раз больше издержек сделки (комиссии + проскальзывание туда-обратно);
+        # у бота может быть свой множитель в его разделе конфига
+        self.min_reward_cost = float(cfg.get(key, {}).get("min_reward_cost",
+                                                          acc.get("min_reward_cost", 2.5)))
         self.account = Account(key, float(acc.get("capital", 100.0)),
                                (float(acc.get("maker_fee", 0.0002)), float(acc.get("taker_fee", 0.00055))),
                                int(acc.get("latency_ms", 250)))
@@ -154,6 +157,11 @@ class Engine:
             self._drain(bot)
             if sec % self.save_every_s == 0:
                 self.refresh(bot)
+        if sec % 60 == 0:
+            try:
+                self._calibration(sec)
+            except OSError:
+                log.exception("Не удалось записать журнал калибровки")
 
     def _enter(self, bot: ShadowBot, m: SymbolMarket, sig, now: int) -> None:
         acc, price = bot.account, m.price()
@@ -162,14 +170,10 @@ class Engine:
         if equity <= 0 or sig.sl_dist <= 0 or not price:
             return
         # Слишком близкий стоп расширяем до min_stop_pct: позиция станет меньше, риск на сделку
-        # тот же, а комиссия — меньшая доля риска. Сигналы с тейком меньше min_reward_cost
-        # стоимостей сделки туда-обратно пропускаем: на них комиссии съедают всё.
+        # тот же, а комиссия — меньшая доля риска.
         floor = bot.min_stop_pct * price
         sl_dist = max(sig.sl_dist, floor)
         trail = max(sig.trail, floor) if sig.trail else 0.0
-        round_trip = acc.taker_fee * 2
-        if sig.tp_dist and sig.tp_dist / price < bot.min_reward_cost * round_trip:
-            return
         qty = bot.risk * equity / sl_dist                         # стоп = risk·капитала
         room = bot.max_leverage * equity - acc.committed(prices)
         qty = min(qty, max(room, 0.0) / price, bot.max_position_leverage * equity / price)
@@ -180,6 +184,14 @@ class Engine:
             qty = math.floor(qty / m.qty_step + 1e-9) * m.qty_step
         if qty <= 0 or qty < m.min_qty or qty * price < max(bot.min_notional, m.min_notional):
             return
+        # Сигналы, где тейк меньше min_reward_cost издержек сделки, пропускаем: на них комиссии
+        # и проскальзывание съедают всё. Издержки — по текущему стакану для этого объёма.
+        if sig.tp_dist:
+            cost = self.trade_cost(acc, m, sig, qty)
+            ratio = (sig.tp_dist / price) / cost if cost > 0 else math.inf
+            bot.strategy.observe("тейк / издержки сделки", ratio, bot.min_reward_cost, m.symbol)
+            if ratio < bot.min_reward_cost:
+                return
         meta = {"sl_dist": sl_dist, "tp_dist": sig.tp_dist, "time_stop_s": sig.time_stop_s,
                 "trail": trail, "reason": sig.reason, "mid0": m.book.mid() or price,
                 "tick": m.tick}
@@ -191,6 +203,44 @@ class Engine:
         else:
             o = Order(m.symbol, side, "market", qty, meta=meta)
         acc.submit(o, m.book, now)
+
+    @staticmethod
+    def trade_cost(acc: Account, m: SymbolMarket, sig, qty: float) -> float:
+        """Издержки сделки туда-обратно в долях цены: комиссии Bybit плюс проскальзывание.
+        Вход лимиткой — комиссия мейкера без проскальзывания; выход считаем худшим —
+        рыночным (стоп или время): комиссия тейкера и проход по стакану на этот объём."""
+        book = m.book
+        mid = book.mid() or m.price()
+        if not mid:
+            return acc.taker_fee * 2
+        buy = sig.side > 0
+
+        def slip(side: str) -> float:
+            avg, filled = book.walk(side, qty)
+            return abs(avg / mid - 1) if filled > 0 else 0.0
+
+        entry = acc.maker_fee if sig.entry == "limit" else acc.taker_fee + slip("buy" if buy else "sell")
+        exit_ = acc.taker_fee + slip("sell" if buy else "buy")
+        return entry + exit_
+
+    def _calibration(self, sec: int) -> None:
+        """Раз в минуту: максимумы условий входа каждого бота — в state/shadow_calibration.csv."""
+        rows = []
+        for bot in self.bots.values():
+            for metric, (value, threshold, symbol) in bot.strategy.take_observations().items():
+                rows.append({"ts": iso(sec * 1000), "bot": bot.key, "metric": metric,
+                             "value": round(value, 8), "threshold": threshold,
+                             "ratio": round(value / threshold, 4) if threshold else "",
+                             "symbol": symbol})
+        if not rows:
+            return
+        path = self.state_dir / "shadow_calibration.csv"
+        new = not path.exists()
+        with path.open("a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0]))
+            if new:
+                w.writeheader()
+            w.writerows(rows)
 
     def _drain(self, bot: ShadowBot) -> None:
         for ev in bot.account.events:

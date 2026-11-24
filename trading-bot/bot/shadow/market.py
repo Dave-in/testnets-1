@@ -39,6 +39,7 @@ class SymbolMarket:
         self.max_mkt_qty = 0.0
         self.min_notional = 0.0
         self.tick = 0.0
+        self.funding_interval_h = 8.0         # у части монет фандинг раз в 1 или 4 часа
         self._sigma_cache: tuple[int, float] = (-1, 0.0)
 
     # --- поступление данных ----------------------------------------------------

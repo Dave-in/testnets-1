@@ -208,6 +208,17 @@ def cmd_shadow_replay(args) -> None:
     print(f"\nЖурналы сделок: {args.state_dir}/shadow_*_trades.csv")
 
 
+def cmd_shadow_calib(args) -> None:
+    """Как близко теневые боты подходят к порогам входа (по журналу калибровки)."""
+    import html
+    import re
+
+    from .shadow.calib import report
+
+    text = report(Path(args.state_dir) / "shadow_calibration.csv", args.days)
+    print(html.unescape(re.sub(r"</?b>", "", text)))
+
+
 def cmd_ctl(args) -> None:
     """Управление запущенным ботом и просмотр состояния."""
     import json
@@ -365,6 +376,11 @@ def main(argv=None) -> None:
     sr.add_argument("--cache", default="data/replay")
     sr.add_argument("--state-dir", default="state/replay")
     sr.set_defaults(func=cmd_shadow_replay)
+
+    sc = sub.add_parser("shadow-calib", help="как близко теневые боты подходят к порогам входа")
+    sc.add_argument("--days", type=float, default=3.0, help="за сколько последних дней")
+    sc.add_argument("--state-dir", default="state")
+    sc.set_defaults(func=cmd_shadow_calib)
 
     c = sub.add_parser("ctl", help="управление: status | pause | resume | close-all | stop")
     c.add_argument("action", choices=["status", "pause", "resume", "close-all", "stop"])
