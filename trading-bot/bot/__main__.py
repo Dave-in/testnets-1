@@ -278,14 +278,15 @@ def cmd_tg_setup(args) -> None:
     С --wait N ждёт первое сообщение до N секунд и сам записывает TELEGRAM_CHAT_ID в .env."""
     import time
 
-    from .telegram import Telegram
+    from .telegram import RateLimited, Telegram
 
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise SystemExit("Сначала задайте TELEGRAM_BOT_TOKEN в .env (токен выдаёт @BotFather).")
     chat = os.getenv("TELEGRAM_CHAT_ID")
     tg = Telegram(token, chat)
-    me = tg.call("getMe", {})
+    print("Проверяю токен в Telegram…")
+    me = tg.call_patiently("getMe", {})
     if not me.get("ok"):
         raise SystemExit(f"Telegram не принял токен: {me.get('description')}")
     name = me["result"].get("username")
@@ -298,7 +299,17 @@ def cmd_tg_setup(args) -> None:
         deadline = time.time() + args.wait
         seen: dict = {}
         while not seen:
-            for u in tg.updates(timeout=min(25, max(0, int(deadline - time.time())))):
+            try:
+                batch = tg.updates(timeout=min(25, max(0, int(deadline - time.time()))))
+            except RateLimited as e:
+                print(f"Telegram просит подождать {e.retry_after:g} с — жду…")
+                time.sleep(e.retry_after + 1)
+                batch = []
+            except Exception as e:  # noqa: BLE001 — сеть рвётся: пробуем снова до срока
+                print(f"Telegram не ответил ({type(e).__name__}), пробую снова…")
+                time.sleep(5)
+                batch = []
+            for u in batch:
                 c = (u.get("message") or {}).get("chat") or {}
                 # только личный чат: группы (в том числе сообщение о добавлении бота в группу)
                 # для управления не годятся — группу привязывает /here
@@ -313,7 +324,7 @@ def cmd_tg_setup(args) -> None:
         _save_env_value("TELEGRAM_CHAT_ID", chat)
         print("TELEGRAM_CHAT_ID записан в .env")
         tg.chat_id = chat
-    ok = tg.send("✅ Связь есть. Бот будет присылать сюда сигналы и отчёты.")
+    ok = tg.send("✅ Связь есть. Бот будет присылать сюда сигналы и отчёты.", wait_on_limit=True)
     print(f"Тестовое сообщение в чат {chat}: {'отправлено' if ok else 'ОШИБКА (см. выше)'}")
     if not ok:
         raise SystemExit(1)

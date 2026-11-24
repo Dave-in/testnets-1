@@ -768,13 +768,16 @@ def test_tg_setup_takes_private_chat_not_group(tmp_path, monkeypatch):
         def call(self, method, payload, timeout=15.0):
             return {"ok": True, "result": {"username": "my_bot"}}
 
+        def call_patiently(self, method, payload, **kw):
+            return self.call(method, payload)
+
         def updates(self, timeout=25):
             return [{"update_id": 1, "message": {"chat": {"id": -100555, "type": "supergroup",
                                                           "title": "Группа"}}},
                     {"update_id": 2, "message": {"chat": {"id": 777, "type": "private",
                                                           "first_name": "Я"}}}]
 
-        def send(self, text):
+        def send(self, text, **kw):
             self.sent.append(text)
             return True
 
@@ -832,3 +835,46 @@ def test_universe_skips_most_traded_and_reference_is_data_only(tmp_path, monkeyp
     eng.advance(T0 + 2000)
     assert "BTCUSDT" not in {o.symbol for o in eng.bots["fade"].account.orders} | \
         set(eng.bots["fade"].account.positions)
+
+
+def test_telegram_waits_out_rate_limit_and_timeouts(monkeypatch):
+    import requests
+
+    import bot.telegram as T
+    waited = []
+    monkeypatch.setattr(T.time, "sleep", lambda s: waited.append(s))
+    answers = [requests.exceptions.ReadTimeout("hang"),
+               {"ok": False, "error_code": 429, "parameters": {"retry_after": 23}},
+               {"ok": True, "result": {"username": "my_bot"}}]
+
+    def post(method, payload, timeout):
+        a = answers.pop(0)
+        if isinstance(a, Exception):
+            raise a
+        return a
+    tg = T.Telegram("T", 111, post)
+    assert tg.call_patiently("getMe", {})["result"]["username"] == "my_bot"
+    assert waited == [5, 24.0]                         # после зависания 5 с, после 429 — сколько просили
+    tg2 = T.Telegram("T", 111, lambda m, p, t: {"ok": False, "error_code": 429,
+                                                 "parameters": {"retry_after": 7}})
+    with pytest.raises(T.RateLimited) as e:
+        tg2.updates()
+    assert e.value.retry_after == 7
+
+
+def test_command_listener_backs_off_on_rate_limit(monkeypatch):
+    import bot.telegram as T
+    waited = []
+    lst = T.CommandListener(T.Telegram("T", 111, lambda *a: {"ok": True}),
+                            bots=[("x", "s.json", "c.json")])
+
+    def fake_sleep(s):
+        waited.append(s)
+        lst.stop_event.set()
+    monkeypatch.setattr(T.time, "sleep", fake_sleep)
+
+    def limited():
+        raise T.RateLimited(31)
+    lst.poll_once = limited
+    lst.run()
+    assert waited == [32]

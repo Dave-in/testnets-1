@@ -36,6 +36,14 @@ def split_message(text: str, limit: int = 3800) -> list[str]:
     return parts + [cur] if cur else parts
 
 
+class RateLimited(RuntimeError):
+    """Telegram ответил 429: следующий запрос не раньше чем через retry_after секунд."""
+
+    def __init__(self, retry_after: float):
+        super().__init__(f"Telegram просит подождать {retry_after:g} с")
+        self.retry_after = retry_after
+
+
 class Telegram:
     def __init__(self, token: str, chat_id: str | int | None = None, post: Callable | None = None):
         self.token = token
@@ -91,9 +99,34 @@ class Telegram:
             return int(res["result"]["message_thread_id"]), ""
         return None, str(res.get("description") or res)
 
+    def call_patiently(self, method: str, payload: dict, tries: int = 8,
+                       timeout: float = 15.0) -> dict:
+        """Вызов, который переживает временные сбои: при ответе «слишком много запросов» (429)
+        ждёт, сколько просит Telegram (запросы во время ожидания только продлевают его),
+        при зависании или обрыве связи — ждёт всё дольше и повторяет."""
+        last: dict = {}
+        for i in range(tries):
+            try:
+                last = self.call(method, payload, timeout)
+            except Exception as e:  # noqa: BLE001
+                wait = min(5 * 2 ** i, 60)
+                log.warning("Telegram %s: %s, повтор через %d с", method, type(e).__name__, wait)
+                time.sleep(wait)
+                continue
+            retry = (last.get("parameters") or {}).get("retry_after")
+            if last.get("error_code") == 429 and retry:
+                log.warning("Telegram просит подождать %s с", retry)
+                time.sleep(float(retry) + 1)
+                continue
+            return last
+        return last or {"ok": False, "description": "Telegram не ответил"}
+
     def updates(self, timeout: int = 25) -> list[dict]:
         res = self.call("getUpdates", {"offset": self.offset, "timeout": timeout,
                                        "allowed_updates": ["message"]}, timeout=timeout + 10)
+        retry = (res.get("parameters") or {}).get("retry_after")
+        if res.get("error_code") == 429 and retry:
+            raise RateLimited(float(retry))
         if not res.get("ok"):
             # например 409 Conflict: этим же токеном уже читает команды другой запущенный бот
             raise RuntimeError(f"getUpdates: {res.get('description') or res}")
@@ -315,6 +348,9 @@ class CommandListener(threading.Thread):
         while not self.stop_event.is_set():
             try:
                 self.poll_once()
+            except RateLimited as e:          # запросы во время ожидания только продлевают его
+                log.warning("Приём команд: %s", e)
+                time.sleep(e.retry_after + 1)
             except Exception as e:  # noqa: BLE001
                 log.error("Ошибка приёма команд Telegram: %s", e)
                 time.sleep(10)
