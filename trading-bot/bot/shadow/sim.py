@@ -303,13 +303,16 @@ class Account:
         prices = {s: m.price() for s, m in markets.items()}
         if self.positions and self.equity(prices) <= maintenance * self.gross(prices):
             for s in list(self.positions):
-                self.close(s, markets[s].book, now, "liquidation")
+                if s in markets:
+                    self.close(s, markets[s].book, now, "liquidation")
             return True
         return False
 
     def housekeeping(self, markets: dict, now: int) -> None:
         for s, pos in list(self.positions.items()):
-            m = markets[s]
+            m = markets.get(s)
+            if m is None:                         # нет данных по монете — ждём, не падаем
+                continue
             price = m.price()
             if pos.liq_price:                     # изолированная маржа: ликвидация по марк-цене
                 mark = m.mark_price or price

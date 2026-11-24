@@ -271,3 +271,21 @@ def test_default_config_has_eleven_bots(tmp_path):
     assert eng.bots["meme"].universe == "meme" and eng.bots["meme"].account.leverage == 20.0
     assert eng.bots["oi"].account.leverage is None                          # старые не тронуты
     assert eng.bots["ofi"].min_reward_cost == 3.0
+
+
+def test_position_on_coin_outside_universe_is_kept_and_streamed(tmp_path, monkeypatch):
+    from bot.shadow import bybit
+    eng = Engine({"bots": ["fade"], "account": {"capital": 100.0}}, tmp_path)
+    acc = eng.bots["fade"].account
+    acc.positions["OLDUSDT"] = __import__("bot.shadow.sim", fromlist=["Position"]).Position(
+        "OLDUSDT", 1, 1.0, 10.0, T0)
+    acc.housekeeping({}, T0)                                 # нет данных по монете — не падаем
+    monkeypatch.setattr(bybit, "select_universe", lambda cfg: ["NEWUSDT"])
+    monkeypatch.setattr(bybit, "warmup", lambda engine, symbols: [engine.add_market(s) for s in symbols])
+    started = []
+
+    async def fake_stream(engine, symbols, stop):
+        started.append(symbols)
+    monkeypatch.setattr(bybit, "_stream", fake_stream)
+    bybit.run_live(eng)
+    assert "OLDUSDT" in started[0] and "OLDUSDT" not in eng.universes["base"]

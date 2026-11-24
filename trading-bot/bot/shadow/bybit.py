@@ -268,6 +268,12 @@ def run_live(engine: Engine, stop: asyncio.Event | None = None) -> None:
     symbols = list(dict.fromkeys(traded + memes))
     if ref not in symbols:
         symbols.insert(0, ref)
+    # монеты с открытыми позициями, выпавшие из списка: данные нужны, чтобы довести позицию
+    # (стоп, тейк, время); новых входов по ним нет — их нет в списках монет ботов
+    held = sorted({s for b in engine.bots.values() for s in b.account.positions} - set(symbols))
+    if held:
+        symbols += held
+        log.info("Открытые позиции вне списка, подключаю только для сопровождения: %s", ", ".join(held))
     warmup(engine, symbols)
     if ref not in traded and ref not in memes:  # ориентир для «Отставания»: данные есть, сделок нет
         engine.markets[ref].tradable = False

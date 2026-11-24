@@ -413,7 +413,8 @@ class Engine:
             bot.paused = False
         elif cmd == "close-all":
             for s in list(bot.account.positions):
-                bot.account.close(s, self.markets[s].book, self.now, "manual")
+                if s in self.markets:
+                    bot.account.close(s, self.markets[s].book, self.now, "manual")
             bot.account.orders = [o for o in bot.account.orders if o.purpose != "entry"]
             bot.paused = True
         elif cmd == "stop":
