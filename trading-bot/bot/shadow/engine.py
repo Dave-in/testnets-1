@@ -389,9 +389,14 @@ class Engine:
         equity = acc.equity(prices)
         acc.peak = max(acc.peak, equity)
         day = iso(self.now)[:10]
-        if bot.marks.get("day") != day:
+        # до первых данных биржи времени ещё нет (now = 0 → 1970-01-01): смену суток не считаем,
+        # иначе каждый перезапуск сбрасывал бы баланс на начало дня и слал лишний отчёт
+        if self.now and bot.marks.get("day") != day:
             if bot.marks.get("day") and bot.snapshot:
                 bot.day_snapshot = bot.snapshot
+                # итоги завершившегося дня — для отчёта за день
+                bot.marks["last_day"] = {"day": bot.marks["day"],
+                                         "start": bot.marks.get("day_equity", equity), "end": equity}
             bot.marks.update(day=day, day_equity=equity)
             if bot.marks.get("month") != day[:7]:
                 bot.marks.update(month=day[:7], month_equity=equity)

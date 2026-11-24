@@ -319,10 +319,11 @@ def test_shadow_bots_join_group_reports_and_commands(tmp_path, monkeypatch):
     engine.refresh_all()
     for b in engine.bots.values():                   # смена суток → отчёт за день
         b.day_snapshot = b.snapshot
-    group = Group({}, tg, 1, extra)
+        b.marks["last_day"] = {"day": b.marks["day"], "start": 100.0, "end": 100.0}
+    group = Group({}, tg, 1, extra, None, tmp_path)  # группа не привязана → в личный чат
     group.maybe_report()
     report = [p["text"] for p in sent if "Отчёт за день" in p["text"]]
-    assert len(report) == 1 and "Тень · Откат (контроль)" in report[0]
+    assert len(report) == 1 and "Откат (контроль)" in report[0] and "Отставание от BTC" in report[0]
 
     listener = CommandListener(Telegram("T", 111, lambda m, p, t: sent.append(p) or {"ok": True}),
                                bots=[(n, b.state_path, b.control_path) for n, b in extra.items()])

@@ -58,9 +58,11 @@ class Labeled:
 
 class Group:
     def __init__(self, runners: dict[str, Runner], tg=None, poll_seconds: int = 60,
-                 extra: dict | None = None):
+                 extra: dict | None = None, channel=None, state_dir: Path | None = None):
         self.runners = runners
         self.extra = extra or {}   # счета, которые работают сами (теневые боты): только отчёты
+        self.channel = channel     # группа с темами: отчёт за день — в общую тему
+        self.state_dir = state_dir
         self.tg = tg
         self.poll_seconds = poll_seconds
         self.errors = {name: 0 for name in runners}
@@ -95,11 +97,29 @@ class Group:
         self.report_wait += 1
         if len(rolled) < len(accounts) and self.report_wait < 15:
             return
-        items = [(n, r.day_snapshot or r.snapshot) for n, r in accounts.items()]
-        self._send(messages.group_report([(n, s) for n, s in items if s], "Отчёт за день"))
+        if self.runners:                         # дневные счета (если включены) — прежний отчёт
+            items = [(n, r.day_snapshot or r.snapshot) for n, r in self.runners.items()]
+            self._send(messages.group_report([(n, s) for n, s in items if s], "Отчёт за день"))
+        if self.extra and self.state_dir is not None:
+            self.send_daily()
         for r in accounts.values():
             r.day_snapshot = None
         self.report_wait = 0
+
+    def send_daily(self) -> None:
+        """Отчёт за завершившийся день по теневым ботам — в общую тему группы (General),
+        пока группа не привязана — в личный чат."""
+        from .shadow import daily
+        done = [b.marks.get("last_day") for b in self.extra.values() if b.marks.get("last_day")]
+        if not done:
+            return
+        day = max(d["day"] for d in done)
+        balances = {b.key: (b.marks["last_day"]["start"], b.marks["last_day"]["end"])
+                    for b in self.extra.values()
+                    if (b.marks.get("last_day") or {}).get("day") == day}
+        text = daily.build(self.state_dir, day, balances)
+        if self.channel is None or not self.channel.post_general(text):
+            self._send(text)
 
     def run(self, once: bool = False) -> None:
         while True:
@@ -176,7 +196,7 @@ def build_group(path: str | Path, confirm_live: bool = False) -> Group:
         tg.send("🤖 Бот запущен, виртуальных счетов: " + str(len(specs) + len(extra)) + "\n"
                 + "\n".join(lines) + "\n/help — команды.")
     poll = min((c.live.poll_seconds for c in cfgs.values()), default=60)
-    return Group(runners, tg, poll, extra)
+    return Group(runners, tg, poll, extra, channel, base / "state")
 
 
 def start_shadow(cfg: dict, state_dir: Path, tg=None, channel=None) -> dict:

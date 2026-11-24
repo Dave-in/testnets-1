@@ -234,6 +234,18 @@ class ShadowChannel:
             log.error("Очередь Telegram переполнена, сообщение пропущено")
         return True
 
+    def post_general(self, text: str) -> bool:
+        """В общую тему группы (General). False — группа не привязана."""
+        with self.lock:
+            chat = self.chat_id
+        if not chat:
+            return False
+        try:
+            self.queue.put_nowait((chat, None, text))
+        except queue.Full:
+            log.error("Очередь Telegram переполнена, сообщение пропущено")
+        return True
+
     def send_one(self, chat: str, thread: int | None, text: str) -> None:
         if not self.tg.send(text, chat, thread, wait_on_limit=True) and thread:
             self.tg.send(text, chat, None, wait_on_limit=True)   # тему удалили — в общую
@@ -274,7 +286,7 @@ class CommandListener(threading.Thread):
     Состояние берёт из JSON-файла бота, а команды управления кладёт в control-файл —
     то есть с торговым циклом общается только через файлы, без общей памяти."""
 
-    GROUP_COMMANDS = ("/status", "/report", "/calib", "/help", "/start")   # в группе — просмотр
+    GROUP_COMMANDS = ("/status", "/report", "/calib", "/daily", "/help", "/start")   # просмотр
 
     def __init__(self, tg: Telegram, state_path: Path | None = None,
                  control_path: Path | None = None, bots: list[tuple] | None = None,
@@ -319,6 +331,14 @@ class CommandListener(threading.Thread):
             return "\n\n".join(
                 (f"<b>[{messages.escape(n)}]</b>\n" if many else "") + messages.status_text(s)
                 for n, s in snaps)
+        if cmd == "/daily":
+            if self.calib_path is None:
+                return "Отчёт за день есть только у теневых ботов, а они не запущены."
+            from datetime import datetime, timezone
+
+            from .shadow import daily
+            day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            return daily.build(self.calib_path.parent, day, title="Отчёт за сегодня на этот момент,")
         if cmd == "/calib":
             if self.calib_path is None:
                 return "Калибровка есть только у теневых ботов, а они не запущены."
@@ -373,6 +393,8 @@ class CommandListener(threading.Thread):
                 if chat == self.group.chat_id and cmd in self.GROUP_COMMANDS:
                     self.tg.send(self.handle(text), chat, thread)
                     continue
+            if self.group is not None and chat == self.group.chat_id:
+                continue                          # обычные и служебные сообщения группы
             log.warning("Сообщение из чужого чата %s проигнорировано", chat)
 
     def run(self) -> None:
