@@ -293,18 +293,21 @@ def cmd_tg_setup(args) -> None:
 
     if not chat:
         if args.wait:
-            print(f"Откройте https://t.me/{name} и отправьте боту /start — жду до {args.wait} с…")
+            print(f"Откройте https://t.me/{name} и отправьте боту /start в личном чате — "
+                  f"жду до {args.wait} с…")
         deadline = time.time() + args.wait
         seen: dict = {}
         while not seen:
             for u in tg.updates(timeout=min(25, max(0, int(deadline - time.time())))):
                 c = (u.get("message") or {}).get("chat") or {}
-                if c.get("id"):
-                    seen[c["id"]] = c.get("username") or c.get("title") or c.get("first_name") or ""
+                # только личный чат: группы (в том числе сообщение о добавлении бота в группу)
+                # для управления не годятся — группу привязывает /here
+                if c.get("id") and c.get("type", "private") == "private":
+                    seen[c["id"]] = c.get("username") or c.get("first_name") or ""
             if time.time() >= deadline:
                 break
         if not seen:
-            raise SystemExit("Боту никто не написал. Отправьте ему /start и повторите команду.")
+            raise SystemExit("Боту никто не написал в личный чат. Отправьте ему /start и повторите команду.")
         chat = str(next(iter(seen)))
         print(f"Найден чат: {chat} ({seen[int(chat)]})")
         _save_env_value("TELEGRAM_CHAT_ID", chat)

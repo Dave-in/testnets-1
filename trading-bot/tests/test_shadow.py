@@ -753,3 +753,34 @@ def test_calibration_log_and_report(tmp_path):
                           bots=[("x", tmp_path / "s.json", tmp_path / "c.json")], calib_path=path)
     assert "Калибровка порогов" in lst.handle("/calib 1")
     assert "пока нет" in report(tmp_path / "нет.csv")
+
+
+def test_tg_setup_takes_private_chat_not_group(tmp_path, monkeypatch):
+    import types
+
+    import bot.__main__ as cli
+    import bot.telegram as T
+
+    class FakeTG:
+        def __init__(self, token, chat=None):
+            self.chat_id, self.sent = chat, []
+
+        def call(self, method, payload, timeout=15.0):
+            return {"ok": True, "result": {"username": "my_bot"}}
+
+        def updates(self, timeout=25):
+            return [{"update_id": 1, "message": {"chat": {"id": -100555, "type": "supergroup",
+                                                          "title": "Группа"}}},
+                    {"update_id": 2, "message": {"chat": {"id": 777, "type": "private",
+                                                          "first_name": "Я"}}}]
+
+        def send(self, text):
+            self.sent.append(text)
+            return True
+
+    monkeypatch.setattr(T, "Telegram", FakeTG)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "T")
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    cli.cmd_tg_setup(types.SimpleNamespace(wait=1))
+    assert "TELEGRAM_CHAT_ID=777" in (tmp_path / ".env").read_text(encoding="utf-8")
