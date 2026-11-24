@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import itertools
 import math
 from collections import deque
 
@@ -22,7 +23,10 @@ class SymbolMarket:
         self.book = book if book is not None else OrderBook()
         self.last_price = 0.0
         self.last_ts = 0
-        self.trades: deque = deque()          # (ts, цена, объём в $ со знаком: + покупка тейкером)
+        # Лента сделок — сводками по секундам, а не поштучно (поштучно это сотни тысяч мелких
+        # объектов в час и постоянный рост памяти): [секунда, Σ цена·$, Σ $, Σ $ со знаком
+        # (+ покупка тейкером)]. Хранится 15 минут.
+        self.trades: deque = deque()
         self.sec: deque = deque(maxlen=SECONDS_KEPT)       # цена на конец каждой секунды
         self.minute_closes: deque = deque(maxlen=MINUTES_KEPT)
         self.liqs: deque = deque()            # (ts, $ ликвидаций)
@@ -46,8 +50,19 @@ class SymbolMarket:
     # --- поступление данных ----------------------------------------------------
     def on_trade(self, ts: int, price: float, qty: float, taker_buy: bool) -> None:
         self.last_price, self.last_ts = price, ts
-        self.trades.append((ts, price, price * qty * (1 if taker_buy else -1)))
-        cut = ts - 15 * 60 * 1000
+        self.add_flow(ts, price, price * qty * (1 if taker_buy else -1))
+
+    def add_flow(self, ts: int, price: float, signed_usd: float) -> None:
+        """Добавить сделку в посекундную сводку ленты."""
+        sec, usd = ts // 1000, abs(signed_usd)
+        last = self.trades[-1] if self.trades else None
+        if last is not None and last[0] == sec:
+            last[1] += price * usd
+            last[2] += usd
+            last[3] += signed_usd
+        else:
+            self.trades.append([sec, price * usd, usd, signed_usd])
+        cut = sec - 15 * 60
         while self.trades and self.trades[0][0] < cut:
             self.trades.popleft()
 
@@ -60,7 +75,12 @@ class SymbolMarket:
 
     def on_open_interest(self, ts: int, value: float) -> None:
         if value > 0:
-            self.oi.append((ts, value))
+            # Bybit присылает открытый интерес несколько раз в секунду; для окна в минуты
+            # хватает точки раз в 5 с — последнее значение за эти 5 с заменяет предыдущее
+            if len(self.oi) > 1 and ts - self.oi[-2][0] < 5000:
+                self.oi[-1] = (ts, value)
+            else:
+                self.oi.append((ts, value))
             cut = ts - 3600 * 1000
             while self.oi and self.oi[0][0] < cut:
                 self.oi.popleft()
@@ -101,9 +121,10 @@ class SymbolMarket:
 
     def extreme(self, seconds: int, side: int) -> float:
         """Максимум (side=+1) или минимум (side=−1) цены за последние seconds секунд."""
-        window = list(self.sec)[-seconds - 1:]
-        if not window:
+        if not self.sec:
             return 0.0
+        # только хвост окна, без копирования всей 6-часовой истории каждую секунду
+        window = itertools.islice(reversed(self.sec), seconds + 1)
         return max(window) if side > 0 else min(window)
 
     def sigma1m(self) -> float:
@@ -126,23 +147,23 @@ class SymbolMarket:
 
     def flow(self, seconds: int, now: int) -> float:
         """Перекос агрессивных сделок за окно: (покупки − продажи) / (покупки + продажи)."""
-        cut = now - seconds * 1000
+        cut = (now - seconds * 1000) // 1000
         signed = total = 0.0
-        for ts, _, v in reversed(self.trades):
-            if ts < cut:
+        for sec, _, usd, s in reversed(self.trades):
+            if sec < cut:
                 break
-            signed += v
-            total += abs(v)
+            signed += s
+            total += usd
         return signed / total if total else 0.0
 
     def vwap(self, seconds: int, now: int) -> float:
-        cut = now - seconds * 1000
+        cut = (now - seconds * 1000) // 1000
         pv = vol = 0.0
-        for ts, p, v in reversed(self.trades):
-            if ts < cut:
+        for sec, p_usd, usd, _ in reversed(self.trades):
+            if sec < cut:
                 break
-            pv += p * abs(v)
-            vol += abs(v)
+            pv += p_usd
+            vol += usd
         return pv / vol if vol else self.price()
 
     def liq_sum(self, seconds: int, now: int) -> float:

@@ -143,7 +143,7 @@ def test_fade_signal_after_exhausted_spike():
     prices = calm(600) + list(np.linspace(100, 103, 259)) + [103.0] + [102.8] * 40
     m = market(prices)
     sig = S.FadeSpike().check(m, T0, {})
-    m.trades.extend([(T0 - 1000, 100.5, 1000.0)])          # средняя цена ниже текущей
+    m.add_flow(T0 - 1000, 100.5, 1000.0)          # средняя цена ниже текущей
     sig = S.FadeSpike().check(m, T0, {})
     assert sig is not None and sig.side == -1 and sig.tp_dist > 0
     assert S.FadeSpike().check(market(calm()), T0, {}) is None
@@ -174,7 +174,7 @@ def test_liquidation_cascade_arms_then_enters_after_quiet():
 def test_book_imbalance_needs_persistence_and_flow():
     ob = book(100.0, bid_size=40.0, ask_size=8.0)
     m = market(calm(), ob=ob)
-    m.trades.extend([(T0 - 1000, 100.0, 5000.0)])                       # агрессивные покупки
+    m.add_flow(T0 - 1000, 100.0, 5000.0)                       # агрессивные покупки
     strat = S.BookImbalance()
     sigs = [strat.check(m, T0 + i * 1000, {}) for i in range(5)]
     assert sigs[:4] == [None] * 4 and sigs[4] is not None                # 5 секунд подряд
@@ -189,7 +189,7 @@ def test_oi_and_funding_signals():
     assert sig is not None and sig.side == 1 and sig.trail > 0
     f = market(calm(700) + list(np.linspace(100, 99, 300)))
     f.funding_rate = 0.001                                                 # толпа в лонгах
-    f.trades.extend([(T0 - 1000, 99.8, 1000.0)])
+    f.add_flow(T0 - 1000, 99.8, 1000.0)
     sig = S.FundingSkew().check(f, T0, {})
     assert sig is not None and sig.side == -1
 
@@ -254,7 +254,7 @@ def test_bybit_message_parsing(tmp_path):
     assert m.book.best_bid() == 99.8 and m.book.best_ask() == 100.0
     handle_message(eng, {"topic": "publicTrade.SOLUSDT", "ts": T0 + 30,
                          "data": [{"T": T0 + 30, "s": "SOLUSDT", "S": "Sell", "v": "2", "p": "99.8"}]})
-    assert m.last_price == 99.8 and m.trades[-1][2] < 0
+    assert m.last_price == 99.8 and m.trades[-1][3] < 0
     handle_message(eng, {"topic": "tickers.SOLUSDT", "type": "delta", "ts": T0 + 40,
                          "data": {"symbol": "SOLUSDT", "fundingRate": "0.0003",
                                   "nextFundingTime": str(T0 + 3_600_000), "openInterestValue": "5000000"}})
@@ -690,7 +690,7 @@ def test_old_journal_with_other_columns_is_set_aside(tmp_path):
 def test_funding_rate_is_compared_per_8_hours():
     def falling():
         f = market(calm(700) + list(np.linspace(100, 99, 300)))
-        f.trades.extend([(T0 - 1000, 99.8, 1000.0)])
+        f.add_flow(T0 - 1000, 99.8, 1000.0)
         return f
     f8 = falling()
     f8.funding_rate, f8.funding_interval_h = 0.0001, 8.0                 # 0.01% за 8 ч — обычная
@@ -708,7 +708,7 @@ def test_book_imbalance_uses_top_levels_only():
     ob.snapshot(bids, asks, T0)                                         # «стена» глубже 3-го уровня
     assert abs(ob.imbalance(3)) < 0.01 and ob.imbalance(10) > 0.5
     m = market(calm(), ob=ob)
-    m.trades.extend([(T0 - 1000, 100.0, 5000.0)])
+    m.add_flow(T0 - 1000, 100.0, 5000.0)
     strat = S.BookImbalance()
     assert all(strat.check(m, T0 + i * 1000, {}) is None for i in range(6))
 
@@ -878,3 +878,38 @@ def test_command_listener_backs_off_on_rate_limit(monkeypatch):
     lst.poll_once = limited
     lst.run()
     assert waited == [32]
+
+
+# --- память: сводки по секундам вместо поштучного хранения ---------------------------------
+
+def test_trade_flow_is_stored_per_second_with_same_results():
+    m = SymbolMarket("X", book(100.0))
+    raw = []
+    rng = np.random.default_rng(5)
+    for i in range(3000):                                       # ~10 сделок в секунду, 5 минут
+        ts = T0 + i * 100
+        p = 100 + rng.normal(0, 0.1)
+        q = float(rng.uniform(0.1, 2))
+        buy = bool(rng.integers(0, 2))
+        m.on_trade(ts, p, q, buy)
+        raw.append((ts, p, p * q * (1 if buy else -1)))
+    assert len(m.trades) == 300                                 # 300 секунд, а не 3000 сделок
+    now = T0 + 3000 * 100
+    for window in (30, 120):
+        cut = (now - window * 1000) // 1000 * 1000
+        sel = [(p, v) for ts, p, v in raw if ts >= cut]
+        flow = sum(v for _, v in sel) / sum(abs(v) for _, v in sel)
+        vwap = sum(p * abs(v) for p, v in sel) / sum(abs(v) for _, v in sel)
+        assert m.flow(window, now) == pytest.approx(flow)
+        assert m.vwap(window, now) == pytest.approx(vwap)
+    m.on_trade(T0 + 20 * 60 * 1000, 100.0, 1.0, True)          # старше 15 минут — выброшено
+    assert len(m.trades) == 1
+
+
+def test_open_interest_sampled_every_5_seconds_and_extreme_unchanged():
+    m = SymbolMarket("X")
+    for i in range(600):                                        # 10 обновлений в секунду, минута
+        m.on_open_interest(T0 + i * 100, 1e9 + i)
+    assert len(m.oi) <= 14 and m.oi[-1][1] == 1e9 + 599         # последнее значение сохранено
+    m.sec.extend([100.0, 105.0, 101.0, 99.0, 102.0])
+    assert m.extreme(2, 1) == 102.0 and m.extreme(3, -1) == 99.0 and m.extreme(10, 1) == 105.0
