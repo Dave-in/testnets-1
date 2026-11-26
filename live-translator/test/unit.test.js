@@ -35,6 +35,10 @@ test("session.update: только текст для ElevenLabs", () => {
 test("адрес Qwen", () => {
   assert.equal(qwenUrl({ model: "m", region: "intl" }), "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime?model=m");
   assert.equal(qwenUrl({ model: "m", region: "cn" }), "wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model=m");
+  assert.equal(
+    qwenUrl({ model: "m", apiHost: "https://ws-abc.ap-southeast-1.maas.aliyuncs.com/" }),
+    "wss://ws-abc.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/realtime?model=m"
+  );
 });
 
 test("classify", () => {

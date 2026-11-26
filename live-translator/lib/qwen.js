@@ -18,9 +18,11 @@ export const ASR_MODEL = "qwen3-asr-flash-realtime";
 export const INPUT_RATE = 16000;
 export const OUTPUT_RATE = 24000;
 
-export function qwenUrl({ model, region = "intl", override }) {
+export function qwenUrl({ model, region = "intl", apiHost, override }) {
   if (override) return `${override}${override.includes("?") ? "&" : "?"}model=${encodeURIComponent(model)}`;
-  const host = QWEN_HOSTS[region] || QWEN_HOSTS.intl;
+  // API Host рабочего пространства (ws-xxxx.ap-southeast-1.maas.aliyuncs.com) — для ключей вида sk-ws-…
+  const clean = (apiHost || "").trim().replace(/^[a-z]+:\/\//i, "").replace(/\/.*$/, "");
+  const host = clean || QWEN_HOSTS[region] || QWEN_HOSTS.intl;
   return `wss://${host}/api-ws/v1/realtime?model=${encodeURIComponent(model)}`;
 }
 

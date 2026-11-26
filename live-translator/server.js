@@ -18,6 +18,7 @@ const CFG = {
   password: env.APP_PASSWORD || "",
   qwenKey: env.DASHSCOPE_API_KEY || "",
   qwenRegion: env.QWEN_REGION || "intl",
+  qwenApiHost: env.QWEN_API_HOST || "",
   qwenModel: env.QWEN_MODEL || "qwen3.5-livetranslate-flash-realtime",
   qwenUrlOverride: env.QWEN_WS_URL || "",
   qwenClonedVoice: env.QWEN_VOICE_ID || "",
@@ -171,7 +172,7 @@ wss.on("connection", (client) => {
     let mine = null;
     mine = qwen = openQwen({
       apiKey: CFG.qwenKey,
-      url: qwenUrl({ model: CFG.qwenModel, region: CFG.qwenRegion, override: CFG.qwenUrlOverride }),
+      url: qwenUrl({ model: CFG.qwenModel, region: CFG.qwenRegion, apiHost: CFG.qwenApiHost, override: CFG.qwenUrlOverride }),
       sessionUpdate: update,
       onEvent: (ev) => {
         if (qwen !== mine) return; // событие от уже остановленной сессии
