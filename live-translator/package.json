@@ -1,0 +1,20 @@
+{
+  "name": "live-translator",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Синхронный перевод с телефона: Qwen LiveTranslate + опционально ElevenLabs (клон голоса)",
+  "type": "module",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "start:local": "node --env-file=.env server.js",
+    "test": "node --test test/unit.test.js",
+    "test:e2e": "node test/e2e.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

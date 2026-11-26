@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Синхронный перевод</title>
+  <meta name="description" content="Синхронный перевод русской речи вашим голосом: Qwen LiveTranslate и ElevenLabs">
+  <meta name="theme-color" content="#0f1115" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#f6f7f9" media="(prefers-color-scheme: light)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Перевод">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon.svg">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="app">
+    <header class="top">
+      <h1>Синхронный перевод</h1>
+      <span id="status" class="status" data-state="idle">Готов</span>
+    </header>
+
+    <section class="card">
+      <div class="label">Русский → </div>
+      <div id="targets" class="seg" role="radiogroup" aria-label="Язык перевода"></div>
+    </section>
+
+    <section class="card">
+      <div class="label">Чей голос озвучивает</div>
+      <div class="modes" role="radiogroup" aria-label="Режим озвучки">
+        <label class="mode">
+          <input type="radio" name="mode" value="qwen" checked>
+          <span><b>Qwen</b><small>Быстрее всего. Клонирует голос прямо из вашей речи</small></span>
+        </label>
+        <label class="mode" id="elevenOption">
+          <input type="radio" name="mode" value="elevenlabs">
+          <span><b>ElevenLabs</b><small id="elevenHint">Голос максимально похож, задержка чуть больше</small></span>
+        </label>
+      </div>
+      <div id="qwenVoiceRow" class="row">
+        <label for="voice">Голос Qwen</label>
+        <select id="voice"></select>
+      </div>
+    </section>
+
+    <div class="mic-wrap">
+      <button id="micBtn" class="mic" aria-pressed="false" aria-label="Начать перевод">
+        <span class="ring" id="ring"></span>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-2.08A7 7 0 0 0 19 12h-2Z"/></svg>
+      </button>
+      <div class="meta">
+        <span id="latency" class="chip" hidden></span>
+        <span id="hint" class="hint">Нажмите и говорите по-русски</span>
+      </div>
+    </div>
+
+    <section id="log" class="log" aria-live="polite"></section>
+
+    <details class="card settings">
+      <summary>Настройки</summary>
+      <div class="row" id="pwRow" hidden>
+        <label for="password">Пароль приложения</label>
+        <input id="password" type="password" autocomplete="current-password">
+      </div>
+      <label class="check">
+        <input type="checkbox" id="duplexMute">
+        <span>Выключать микрофон, пока звучит перевод <small>(включите, если перевод слушаете через динамик, а не в наушниках)</small></span>
+      </label>
+      <button id="clearLog" class="link" type="button">Очистить историю</button>
+    </details>
+
+    <div id="toast" class="toast" role="alert" hidden></div>
+  </main>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
