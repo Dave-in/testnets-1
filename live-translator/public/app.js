@@ -208,7 +208,7 @@ function stop() {
   $("micBtn").setAttribute("aria-pressed", "false");
   $("micBtn").setAttribute("aria-label", "Начать перевод");
   $("ring").style.setProperty("--lvl", 0);
-  $("hint").textContent = "Нажмите и говорите по-русски";
+  $("hint").textContent = "Нажмите и говорите на любом языке";
   setStatus("idle", "Готов");
 }
 
@@ -243,7 +243,7 @@ function onEvent(m) {
       $("hint").textContent =
         m.mode === "qwen" && (m.voiceMode === "once" || m.voiceMode === "always")
           ? "Говорите. Первая фраза уйдёт на клонирование голоса"
-          : "Говорите по-русски";
+          : "Говорите на любом языке";
       break;
     case "speech":
       $("hint").textContent = m.state === "start" ? "Слушаю…" : "Перевожу…";

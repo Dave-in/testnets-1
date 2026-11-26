@@ -29,7 +29,7 @@ export function qwenUrl({ model, region = "intl", apiHost, override }) {
 /**
  * Собирает session.update.
  * @param {object} o
- * @param {string} o.source  язык речи (ru)
+ * @param {string} [o.source]  язык речи; не задан — модель определяет язык сама
  * @param {string} o.target  язык перевода (en | es | ur)
  * @param {boolean} o.audio  нужна ли озвучка от Qwen (false — только текст, озвучивает ElevenLabs)
  * @param {string} o.voiceMode  "once" | "always" — клон голоса на лету; "fixed" — заранее созданный клон;
@@ -41,7 +41,7 @@ export function buildSessionUpdate({ source, target, audio, voiceMode, voice, si
     modalities: audio ? ["text", "audio"] : ["text"],
     input_audio_format: "pcm",
     sample_rate: INPUT_RATE,
-    input_audio_transcription: { model: ASR_MODEL, language: source },
+    input_audio_transcription: source ? { model: ASR_MODEL, language: source } : { model: ASR_MODEL },
     translation: {
       language: target,
       // Если микрофон слышит собственный перевод (уже на целевом языке), модель его пропустит.

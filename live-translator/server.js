@@ -30,7 +30,6 @@ const CFG = {
   maxMinutes: Number(env.MAX_SESSION_MINUTES || 60),
 };
 
-const SOURCE = "ru";
 const TARGETS = { en: "English", es: "Español", ur: "اردو" };
 const PRESET_VOICES = ["Alek", "Harvey", "Andre", "Ethan", "Aiden", "Bodega", "Tina", "Serena", "Jennifer", "Sonrisa", "Marina", "Katerina"];
 
@@ -167,7 +166,7 @@ wss.on("connection", (client) => {
       feeder = new SentenceFeeder((text) => sp.speak(text));
     }
 
-    const update = buildSessionUpdate({ source: SOURCE, target, audio: mode === "qwen", voiceMode, voice });
+    const update = buildSessionUpdate({ target, audio: mode === "qwen", voiceMode, voice });
     const fd = feeder;
     let mine = null;
     mine = qwen = openQwen({

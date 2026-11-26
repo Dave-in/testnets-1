@@ -28,6 +28,9 @@ test("session.update: готовый клон и готовый голос", () 
 test("session.update: только текст для ElevenLabs", () => {
   const s = buildSessionUpdate({ source: "ru", target: "en", audio: false }).session;
   assert.deepEqual(s.modalities, ["text"]);
+  const auto = buildSessionUpdate({ target: "en", audio: false }).session;
+  assert.equal("language" in auto.input_audio_transcription, false); // язык речи определяет модель
+  assert.equal(auto.input_audio_transcription.model, "qwen3-asr-flash-realtime");
   assert.equal(s.voice, undefined);
   assert.equal(s.enable_voice_clone, undefined);
 });
