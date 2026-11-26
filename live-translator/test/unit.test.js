@@ -12,6 +12,7 @@ test("session.update: клон голоса на лету", () => {
   assert.equal(s.enable_voice_clone, true);
   assert.deepEqual(s.voice_clone_options, { frequency: "once" });
   assert.equal(s.translation.language, "ur");
+  assert.equal("same_language_skip_options" in s.translation, false); // Qwen отвергает её для ur/es
   assert.equal(s.input_audio_transcription.language, "ru");
   assert.equal(s.sample_rate, 16000);
 });
@@ -19,6 +20,9 @@ test("session.update: клон голоса на лету", () => {
 test("session.update: готовый клон и готовый голос", () => {
   const f = buildSessionUpdate({ source: "ru", target: "en", audio: true, voiceMode: "fixed", voice: "qwen-tts-vc-x" }).session;
   assert.equal(f.voice, "qwen-tts-vc-x");
+  assert.deepEqual(f.translation.same_language_skip_options, { skip_text: true, skip_audio: true }); // en
+  const es = buildSessionUpdate({ target: "es", audio: true, voiceMode: "once" }).session;
+  assert.equal("same_language_skip_options" in es.translation, false);
   assert.deepEqual(f.voice_clone_options, { frequency: "never" });
   const p = buildSessionUpdate({ source: "ru", target: "es", audio: true, voiceMode: "preset", voice: "Harvey" }).session;
   assert.equal(p.voice, "Harvey");

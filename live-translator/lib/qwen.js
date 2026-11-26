@@ -45,7 +45,8 @@ export function buildSessionUpdate({ source, target, audio, voiceMode, voice, si
     translation: {
       language: target,
       // Если микрофон слышит собственный перевод (уже на целевом языке), модель его пропустит.
-      same_language_skip_options: { skip_text: true, skip_audio: true },
+      // Qwen принимает эту опцию только для zh и en, для остальных языков закрывает сессию (1007).
+      ...(target === "en" || target === "zh" ? { same_language_skip_options: { skip_text: true, skip_audio: true } } : {}),
     },
     turn_detection: { type: "server_vad", threshold: 0.2, silence_duration_ms: silenceMs },
   };
